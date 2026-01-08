@@ -444,6 +444,33 @@ with tab1:
             c1.metric("Global Top-1", f"{m['global_top1']*100:.2f}%")
             c2.metric("Global Top-5", f"{m['global_top5']*100:.2f}%")
 
+            # Unified Filter Tag Performance Table
+            st.subheader("Filter Tags Performance")
+            if "matrix_results" in res:
+                unified_data = []
+                # Flatten the matrix_results into one list
+                # matrix_results structure: {Attr: {Val: {stats}}}
+                for attr, vals in res["matrix_results"].items():
+                    for val_name, stats in vals.items():
+                        tag_display = f"{attr}: {val_name}"
+                        unified_data.append({
+                            "Tag": tag_display,
+                            "Top-1": stats['top1'],
+                            "Top-5": stats['top5'],
+                            "Count": stats['count']
+                        })
+
+                # Sort by Tag name
+                unified_data.sort(key=lambda x: x["Tag"])
+
+                # Format for display
+                df_display = pd.DataFrame(unified_data)
+                if not df_display.empty:
+                    # Apply formatting
+                    df_display["Top-1"] = df_display["Top-1"].apply(lambda x: f"{x*100:.2f}%")
+                    df_display["Top-5"] = df_display["Top-5"].apply(lambda x: f"{x*100:.2f}%")
+                    st.dataframe(df_display, use_container_width=True)
+
             st.subheader("Cross-Filter Accuracy Matrix")
 
             # Use saved plots if available (preferred for performance)
@@ -461,7 +488,7 @@ with tab1:
                     else:
                         st.warning("Plot file not found.")
             else:
-                # Fallback to dynamic plotting (if logic fails or old run)
+                # Fallback to dynamic plotting
                 cross = res.get("cross_results", {})
                 tags = cross.get("tags", [])
                 m1 = cross.get("matrix_top1", [])
@@ -487,21 +514,6 @@ with tab1:
                         sns.heatmap(m5_arr, annot=True, fmt=".1%", xticklabels=tags, yticklabels=tags, cmap="Blues", ax=ax, vmin=0, vmax=1)
                         plt.xticks(rotation=45, ha="right")
                         st.pyplot(fig)
-
-            # Per-Attribute Tables
-            st.subheader("Attribute Performance Details")
-            if "matrix_results" in res:
-                for attr, vals in res["matrix_results"].items():
-                    st.markdown(f"**{attr}**")
-                    data_list = []
-                    for val_name, stats in vals.items():
-                        data_list.append({
-                            "Value": val_name,
-                            "Top-1": f"{stats['top1']*100:.2f}%",
-                            "Top-5": f"{stats['top5']*100:.2f}%",
-                            "Count": stats['count']
-                        })
-                    st.dataframe(pd.DataFrame(data_list))
 
 with tab2:
     st.header("Debug View")
