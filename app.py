@@ -439,6 +439,8 @@ with tab1:
 
                 mtab1, mtab2 = st.tabs(["Top-1 Accuracy", "Top-5 Accuracy"])
 
+                ts_str = res.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
+
                 with mtab1:
                     fig, ax = plt.subplots(figsize=(10, 8))
                     sns.heatmap(
@@ -452,6 +454,7 @@ with tab1:
                         vmin=0, vmax=1
                     )
                     plt.xticks(rotation=45, ha="right")
+                    plt.savefig(os.path.join(HISTORY_DIR, f"heatmap_top1_{ts_str}.png"))
                     st.pyplot(fig)
 
                 with mtab2:
@@ -467,6 +470,7 @@ with tab1:
                         vmin=0, vmax=1
                     )
                     plt.xticks(rotation=45, ha="right")
+                    plt.savefig(os.path.join(HISTORY_DIR, f"heatmap_top5_{ts_str}.png"))
                     st.pyplot(fig)
 
 with tab2:
