@@ -134,6 +134,15 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     if not filtered_items:
         return None, "No items match the selected filters."
 
+    attribute_keys = sorted({key for item in items for key in item.attributes.keys()})
+
+    def build_item_tags(dataset_item):
+        tags = set()
+        for key in attribute_keys:
+            value = dataset_item.attributes.get(key, "Unknown")
+            tags.add(f"{key}: {value}")
+        return tags
+
     # Prepare logic
     unique_texts = get_unique_texts(filtered_items)
 
@@ -225,11 +234,8 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
 
     if mode == "i2t":
         for item in filtered_items:
-            tags = set()
-            for k, v in item.attributes.items():
-                tag = f"{k}: {v}"
-                tags.add(tag)
-                all_tags.add(tag)
+            tags = build_item_tags(item)
+            all_tags.update(tags)
             sample_tags.append(tags)
     else:
         for idx, text in enumerate(unique_texts):
@@ -237,15 +243,14 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
             tags = set()
             for oid in origin_indices:
                 item = filtered_items[oid]
-                for k, v in item.attributes.items():
-                    tag = f"{k}: {v}"
-                    tags.add(tag)
-                    all_tags.add(tag)
+                tags.update(build_item_tags(item))
+            all_tags.update(tags)
             sample_tags.append(tags)
 
     sorted_tags = sorted(list(all_tags))
 
     cross_matrix_data = {} # Key: (tag_i, tag_j) -> {sum1, sum5, count}
+    tag_summary = {} # Key: tag -> {sum1, sum5, count}
 
     for i in range(len(performance_records)):
         p_rec = performance_records[i]
@@ -261,6 +266,11 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
                 cross_matrix_data[key]["sum1"] += p_rec[0]
                 cross_matrix_data[key]["sum5"] += p_rec[1]
                 cross_matrix_data[key]["count"] += 1
+            if t1 not in tag_summary:
+                tag_summary[t1] = {"sum1": 0.0, "sum5": 0.0, "count": 0}
+            tag_summary[t1]["sum1"] += p_rec[0]
+            tag_summary[t1]["sum5"] += p_rec[1]
+            tag_summary[t1]["count"] += 1
 
     matrix_top1 = []
     matrix_top5 = []
@@ -285,7 +295,16 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     cross_results = {
         "tags": sorted_tags,
         "matrix_top1": matrix_top1,
-        "matrix_top5": matrix_top5
+        "matrix_top5": matrix_top5,
+        "tag_summary": [
+            {
+                "tag": tag,
+                "top1": tag_summary[tag]["sum1"] / tag_summary[tag]["count"],
+                "top5": tag_summary[tag]["sum5"] / tag_summary[tag]["count"],
+                "count": tag_summary[tag]["count"],
+            }
+            for tag in sorted(tag_summary.keys())
+        ],
     }
 
     results = {
@@ -350,10 +369,12 @@ with tab1:
 
         # Extract available filter options
         filter_options = {}
+        attribute_keys = sorted({key for item in items for key in item.attributes.keys()})
+        for key in attribute_keys:
+            filter_options[key] = set()
         for item in items:
-            for k, v in item.attributes.items():
-                if k not in filter_options: filter_options[k] = set()
-                filter_options[k].add(v)
+            for key in attribute_keys:
+                filter_options[key].add(item.attributes.get(key, "Unknown"))
 
         # Display Filters
         st.subheader("Filters")
@@ -393,6 +414,7 @@ with tab1:
             tags = cross.get("tags", [])
             m1 = cross.get("matrix_top1", [])
             m5 = cross.get("matrix_top5", [])
+            tag_summary = cross.get("tag_summary", [])
 
             if tags:
                 # Ensure data is numeric (handle None from JSON reload or previous state)
@@ -440,6 +462,13 @@ with tab1:
                     )
                     plt.xticks(rotation=45, ha="right")
                     st.pyplot(fig)
+
+            if tag_summary:
+                st.subheader("Per-Attribute Accuracy Summary")
+                summary_df = pd.DataFrame(tag_summary)
+                summary_df["top1"] = summary_df["top1"].map(lambda v: f"{v*100:.2f}%")
+                summary_df["top5"] = summary_df["top5"].map(lambda v: f"{v*100:.2f}%")
+                st.dataframe(summary_df, use_container_width=True)
 
 with tab2:
     st.header("Debug View")
@@ -560,7 +589,10 @@ with tab4:
             all_tags_report = set()
             for d in comparison_data:
                 if "cross_results" in d:
-                    all_tags_report.update(d["cross_results"].get("tags", []))
+                    if d["cross_results"].get("tag_summary"):
+                        all_tags_report.update([row["tag"] for row in d["cross_results"]["tag_summary"]])
+                    else:
+                        all_tags_report.update(d["cross_results"].get("tags", []))
                 elif "matrix_results" in d:
                      for attr, vals in d["matrix_results"].items():
                          for val in vals:
@@ -578,19 +610,29 @@ with tab4:
                     t1, t5, cnt = None, None, None
 
                     if "cross_results" in d:
-                        # Find index of tag
-                        tags = d["cross_results"].get("tags", [])
-                        if tag in tags:
-                            idx = tags.index(tag)
-                            # Diagonal
-                            # Handle potential None/NaN if data came from json or in memory
-                            # The json loader loads null as None.
-                            m1_val = d["cross_results"]["matrix_top1"][idx][idx]
-                            m5_val = d["cross_results"]["matrix_top5"][idx][idx]
+                        if d["cross_results"].get("tag_summary"):
+                            tag_rows = {
+                                row["tag"]: row
+                                for row in d["cross_results"]["tag_summary"]
+                            }
+                            if tag in tag_rows:
+                                t1 = float(tag_rows[tag]["top1"])
+                                t5 = float(tag_rows[tag]["top5"])
+                                cnt = tag_rows[tag]["count"]
+                        else:
+                            # Find index of tag
+                            tags = d["cross_results"].get("tags", [])
+                            if tag in tags:
+                                idx = tags.index(tag)
+                                # Diagonal
+                                # Handle potential None/NaN if data came from json or in memory
+                                # The json loader loads null as None.
+                                m1_val = d["cross_results"]["matrix_top1"][idx][idx]
+                                m5_val = d["cross_results"]["matrix_top5"][idx][idx]
 
-                            if m1_val is not None:
-                                t1 = float(m1_val)
-                                t5 = float(m5_val) if m5_val is not None else 0.0
+                                if m1_val is not None:
+                                    t1 = float(m1_val)
+                                    t5 = float(m5_val) if m5_val is not None else 0.0
 
                     elif "matrix_results" in d:
                         # Parse tag "Attr: Val"
@@ -603,7 +645,8 @@ with tab4:
                                 cnt = stats.get("count")
 
                     if t1 is not None:
-                        html_content += f"<td>{t1*100:.1f}% / {t5*100:.1f}%</td>"
+                        count_suffix = f" ({cnt})" if cnt is not None else ""
+                        html_content += f"<td>{t1*100:.1f}% / {t5*100:.1f}%{count_suffix}</td>"
                     else:
                         html_content += "<td>N/A</td>"
                 html_content += "</tr>"
