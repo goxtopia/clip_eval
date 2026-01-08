@@ -1,4 +1,6 @@
 import os
+import json
+import hashlib
 import random
 from typing import List, Tuple, Dict, Set, Optional
 from .utils import normalize_label
@@ -8,20 +10,39 @@ class DatasetItem:
     def __init__(self, image_path: str, txt_path: str, 
                  raw_labels: List[str], 
                  gt_class_set: Set[str], 
-                 representative_text: str):
+                 representative_text: str,
+                 md5: str = "",
+                 attributes: Optional[Dict] = None):
         self.image_path = image_path
         self.txt_path = txt_path
         self.raw_labels = raw_labels
         self.gt_class_set = gt_class_set  # Expanded GT labels (normalized)
         self.representative_text = representative_text
+        self.md5 = md5
+        self.attributes = attributes or {}
 
 class DataLoader:
-    def __init__(self, data_dir: str, mapper: LabelMapper, seed: int = 42):
+    def __init__(self, data_dir: str, mapper: LabelMapper, seed: int = 42, filter_json_path: str = None):
         self.data_dir = data_dir
         self.mapper = mapper
         self.rng = random.Random(seed)
+        self.filter_json_path = filter_json_path
         self.items: List[DatasetItem] = []
-        
+        self.filter_data = {}
+        if self.filter_json_path and os.path.exists(self.filter_json_path):
+            try:
+                with open(self.filter_json_path, 'r', encoding='utf-8') as f:
+                    self.filter_data = json.load(f)
+            except Exception as e:
+                print(f"[Error] Failed to load filter JSON: {e}")
+
+    def _calculate_md5(self, filepath: str) -> str:
+        hash_md5 = hashlib.md5()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+
     def load(self) -> List[DatasetItem]:
         pairs = self._find_images_and_labels(self.data_dir)
         if not pairs:
@@ -46,7 +67,15 @@ class DataLoader:
             # Sample representative text
             rep_text = self.rng.choice(valid_lines)
             
-            items.append(DatasetItem(img_path, txt_path, valid_lines, expanded_gt, rep_text))
+            # Calculate MD5
+            md5 = self._calculate_md5(img_path)
+
+            # Get attributes from filter data
+            # Key could be image name or md5, we check both. Prioritize MD5.
+            img_name = os.path.basename(img_path)
+            attributes = self.filter_data.get(md5) or self.filter_data.get(img_name) or {}
+
+            items.append(DatasetItem(img_path, txt_path, valid_lines, expanded_gt, rep_text, md5, attributes))
             
         self.items = items
         return items
