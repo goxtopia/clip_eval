@@ -45,10 +45,12 @@ def load_data(data_dir, mapping, filter_path):
 def run_evaluation(items, model_name, pretrained, device, selected_filters):
     # Filter items
     filtered_items = []
-    for item in items:
+    filtered_indices = []
+    for idx, item in enumerate(items):
         match = True
         for key, desired_values in selected_filters.items():
-            if not desired_values: continue
+            if not desired_values:
+                continue
 
             val = item.attributes.get(key, "Unknown")
             if val not in desired_values:
@@ -56,19 +58,20 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters):
                 break
         if match:
             filtered_items.append(item)
+            filtered_indices.append(idx)
 
     if not filtered_items:
         return None, "No items match the selected filters."
 
     # Prepare logic (similar to main.py)
-    unique_texts = get_unique_texts(filtered_items)
+    unique_texts = get_unique_texts(items)
 
     # Load Model
     model = CLIPModel(model_name, pretrained_tag if pretrained_tag else None, None, device, "eval_cache.pt")
     model.load()
 
     # Encode
-    image_paths = [item.image_path for item in filtered_items]
+    image_paths = [item.image_path for item in items]
     image_features = model.encode_images(image_paths, 32)
 
     templates = ["{}"] # Simple template for now
@@ -77,40 +80,58 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters):
     image_features = image_features.to(device)
     text_features = text_features.to(device)
 
-    gt_class_sets = [item.gt_class_set for item in filtered_items]
+    gt_class_sets = [item.gt_class_set for item in items]
 
     # I2T
     sims_i2t = image_features @ text_features.T
     _, top_idx = sims_i2t.topk(k=5, dim=-1)
     pred_classes = top_idx.cpu()
 
-    class_to_images = {}
-    for idx, item in enumerate(filtered_items):
-        if not item.representative_text: continue
+    class_to_images_all = {}
+    for idx, item in enumerate(items):
+        if not item.representative_text:
+            continue
         rep_lbl = normalize_label(item.representative_text)
-        if rep_lbl not in class_to_images: class_to_images[rep_lbl] = []
-        class_to_images[rep_lbl].append(idx)
+        if rep_lbl not in class_to_images_all:
+            class_to_images_all[rep_lbl] = []
+        class_to_images_all[rep_lbl].append(idx)
+
+    pred_classes_filtered = pred_classes[filtered_indices]
+    gt_class_sets_filtered = [gt_class_sets[i] for i in filtered_indices]
+    class_to_images_filtered = {}
+    for idx, item in enumerate(filtered_items):
+        if not item.representative_text:
+            continue
+        rep_lbl = normalize_label(item.representative_text)
+        if rep_lbl not in class_to_images_filtered:
+            class_to_images_filtered[rep_lbl] = []
+        class_to_images_filtered[rep_lbl].append(idx)
+
+    metrics_i2t_all, per_class_i2t_all, bad_cases_i2t_all = compute_metrics(
+        pred_classes, gt_class_sets, unique_texts, class_to_images_all
+    )
 
     metrics_i2t, per_class_i2t, bad_cases_i2t = compute_metrics(
-        pred_classes, gt_class_sets, unique_texts, class_to_images
+        pred_classes_filtered, gt_class_sets_filtered, unique_texts, class_to_images_filtered
     )
 
     # Matrix Breakdown
     # We want to know accuracy per filter attribute value
     # e.g. Time: Day -> Acc, Night -> Acc
-    matrix_results = {}
+    matrix_results_all = {}
+    matrix_results_filtered = {}
 
     # Attributes to check
-    # We get all keys present in attributes of filtered_items
+    # We get all keys present in attributes of items
     all_attr_keys = set()
-    for item in filtered_items:
+    for item in items:
         all_attr_keys.update(item.attributes.keys())
 
-    correct_top1 = [] # Need to reconstruct this list matching filtered_items indices
+    correct_top1 = []
     candidate_norms = [normalize_label(t) for t in unique_texts]
 
     # Re-calculate per-item correctness for matrix grouping
-    for i in range(len(filtered_items)):
+    for i in range(len(items)):
         gset = gt_class_sets[i]
         preds_idx = pred_classes[i].tolist()
         pred_norms = [candidate_norms[p] for p in preds_idx]
@@ -119,25 +140,45 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters):
         correct_top1.append(hit1)
 
     for attr_key in all_attr_keys:
-        matrix_results[attr_key] = {}
+        matrix_results_all[attr_key] = {}
+        matrix_results_filtered[attr_key] = {}
         # Group by value
-        groups = {}
+        groups_all = {}
+        for idx, item in enumerate(items):
+            val = item.attributes.get(attr_key, "Unknown")
+            if val not in groups_all:
+                groups_all[val] = []
+            groups_all[val].append(correct_top1[idx])
+
+        for val, scores in groups_all.items():
+            avg = sum(scores) / len(scores)
+            matrix_results_all[attr_key][val] = {
+                "top1": avg,
+                "count": len(scores)
+            }
+
+        groups_filtered = {}
         for idx, item in enumerate(filtered_items):
             val = item.attributes.get(attr_key, "Unknown")
-            if val not in groups: groups[val] = []
-            groups[val].append(correct_top1[idx])
+            if val not in groups_filtered:
+                groups_filtered[val] = []
+            groups_filtered[val].append(correct_top1[filtered_indices[idx]])
 
-        for val, scores in groups.items():
+        for val, scores in groups_filtered.items():
             avg = sum(scores) / len(scores)
-            matrix_results[attr_key][val] = {
+            matrix_results_filtered[attr_key][val] = {
                 "top1": avg,
                 "count": len(scores)
             }
 
     results = {
         "metrics_i2t": metrics_i2t,
-        "matrix_results": matrix_results,
+        "metrics_i2t_all": metrics_i2t_all,
+        "matrix_results": matrix_results_filtered,
+        "matrix_results_all": matrix_results_all,
+        "matrix_results_filtered": matrix_results_filtered,
         "n_samples": len(filtered_items),
+        "n_samples_all": len(items),
         "timestamp": datetime.now().isoformat(),
         "model": model_name,
         "filters": selected_filters
@@ -201,10 +242,31 @@ with tab1:
         if "last_results" in st.session_state:
             res = st.session_state["last_results"]
             st.subheader("Results")
-            st.metric("Global Top-1", f"{res['metrics_i2t']['global_top1']*100:.2f}%")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Global Top-1 (Filtered)", f"{res['metrics_i2t']['global_top1']*100:.2f}%")
+                st.metric("Filtered Samples", f"{res['n_samples']}")
+            with col2:
+                if "metrics_i2t_all" in res:
+                    st.metric("Global Top-1 (All)", f"{res['metrics_i2t_all']['global_top1']*100:.2f}%")
+                if "n_samples_all" in res:
+                    st.metric("Total Samples", f"{res['n_samples_all']}")
 
-            st.subheader("Matrix Results")
-            for attr, vals in res["matrix_results"].items():
+            st.subheader("Matrix Results (All Images)")
+            for attr, vals in res.get("matrix_results_all", res["matrix_results"]).items():
+                st.write(f"**{attr}**")
+                # Create a dataframe for display
+                df_data = []
+                for val_name, stats in vals.items():
+                    df_data.append({
+                        "Value": val_name,
+                        "Top-1 Acc": f"{stats['top1']*100:.2f}%",
+                        "Count": stats['count']
+                    })
+                st.dataframe(pd.DataFrame(df_data))
+
+            st.subheader("Matrix Results (Filtered)")
+            for attr, vals in res.get("matrix_results_filtered", res["matrix_results"]).items():
                 st.write(f"**{attr}**")
                 # Create a dataframe for display
                 df_data = []
@@ -266,20 +328,22 @@ with tab3:
             html_content += "</head><body><h1>Comparison Report</h1>"
 
             # Summary Table
-            html_content += "<h2>Summary</h2><table><tr><th>Run</th><th>Model</th><th>Samples</th><th>Global Top-1</th><th>Filters</th></tr>"
+            html_content += "<h2>Summary</h2><table><tr><th>Run</th><th>Model</th><th>Filtered Samples</th><th>Total Samples</th><th>Global Top-1 (Filtered)</th><th>Global Top-1 (All)</th><th>Filters</th></tr>"
             for d in comparison_data:
                 filters_str = ", ".join([f"{k}:{v}" for k,v in d.get("filters", {}).items() if v])
-                html_content += f"<tr><td>{d['filename']}</td><td>{d['model']}</td><td>{d['n_samples']}</td><td>{d['metrics_i2t']['global_top1']*100:.2f}%</td><td>{filters_str}</td></tr>"
+                total_samples = d.get("n_samples_all", d.get("n_samples", 0))
+                total_top1 = d.get("metrics_i2t_all", d["metrics_i2t"]).get("global_top1", 0)
+                html_content += f"<tr><td>{d['filename']}</td><td>{d['model']}</td><td>{d['n_samples']}</td><td>{total_samples}</td><td>{d['metrics_i2t']['global_top1']*100:.2f}%</td><td>{total_top1*100:.2f}%</td><td>{filters_str}</td></tr>"
             html_content += "</table>"
 
             # Detailed Matrix Comparison
             # We assume all runs have "matrix_results"
-            html_content += "<h2>Matrix Breakdown</h2>"
+            html_content += "<h2>Matrix Breakdown (All Images)</h2>"
 
             # Collect all attribute keys seen across runs
             all_attrs = set()
             for d in comparison_data:
-                all_attrs.update(d.get("matrix_results", {}).keys())
+                all_attrs.update(d.get("matrix_results_all", d.get("matrix_results", {})).keys())
 
             for attr in sorted(list(all_attrs)):
                 html_content += f"<h3>{attr}</h3><table><tr><th>Value</th>"
@@ -290,13 +354,43 @@ with tab3:
                 # Collect all values for this attr
                 all_vals = set()
                 for d in comparison_data:
-                    vals = d.get("matrix_results", {}).get(attr, {}).keys()
+                    vals = d.get("matrix_results_all", d.get("matrix_results", {})).get(attr, {}).keys()
                     all_vals.update(vals)
 
                 for val in sorted(list(all_vals)):
                     html_content += f"<tr><td>{val}</td>"
                     for d in comparison_data:
-                        stats = d.get("matrix_results", {}).get(attr, {}).get(val)
+                        stats = d.get("matrix_results_all", d.get("matrix_results", {})).get(attr, {}).get(val)
+                        if stats:
+                            html_content += f"<td>{stats['top1']*100:.2f}% / {stats['count']}</td>"
+                        else:
+                            html_content += "<td>N/A</td>"
+                    html_content += "</tr>"
+                html_content += "</table>"
+
+            html_content += "<h2>Matrix Breakdown (Filtered)</h2>"
+
+            # Collect all attribute keys seen across runs
+            all_attrs_filtered = set()
+            for d in comparison_data:
+                all_attrs_filtered.update(d.get("matrix_results_filtered", d.get("matrix_results", {})).keys())
+
+            for attr in sorted(list(all_attrs_filtered)):
+                html_content += f"<h3>{attr}</h3><table><tr><th>Value</th>"
+                for d in comparison_data:
+                    html_content += f"<th>{d['filename']} (Acc / Count)</th>"
+                html_content += "</tr>"
+
+                # Collect all values for this attr
+                all_vals = set()
+                for d in comparison_data:
+                    vals = d.get("matrix_results_filtered", d.get("matrix_results", {})).get(attr, {}).keys()
+                    all_vals.update(vals)
+
+                for val in sorted(list(all_vals)):
+                    html_content += f"<tr><td>{val}</td>"
+                    for d in comparison_data:
+                        stats = d.get("matrix_results_filtered", d.get("matrix_results", {})).get(attr, {}).get(val)
                         if stats:
                             html_content += f"<td>{stats['top1']*100:.2f}% / {stats['count']}</td>"
                         else:
