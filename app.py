@@ -390,6 +390,8 @@ with tab1:
             eval_mode = st.selectbox("Evaluation Mode", ["i2t", "t2i"])
         with c2:
             enable_debug = st.checkbox("Enable Debug Mode (Save Bad Cases)")
+        with c3:
+            show_support = st.checkbox("Show Support (Count)")
 
         # Extract available filter options
         filter_options = {}
@@ -460,11 +462,14 @@ with tab1:
                 m1_arr = to_float_array(m1)
                 m5_arr = to_float_array(m5)
 
+                counts_arr = np.array(cross.get("matrix_counts", []))
+
                 # Iterate over groups to create sub-matrices
                 # If no groups found (no ": " in tags), fallback to full matrix?
                 # The prompt implies structured tags. If simple tags, maybe just one group.
                 
-                groups_to_plot = list(tag_groups.keys()) if tag_groups else ["All"]
+                # Ensure "All" is always present and first
+                groups_to_plot = ["All"] + sorted(list(tag_groups.keys()))
                 
                 for grp in groups_to_plot:
                     print(f"Processing group: {grp}")
@@ -493,7 +498,37 @@ with tab1:
                     # numpy advanced indexing
                     sub_m1 = m1_arr[np.ix_(row_indices, col_indices)]
                     sub_m5 = m5_arr[np.ix_(row_indices, col_indices)]
+                    sub_counts = counts_arr[np.ix_(row_indices, col_indices)]
                     
+                    # Prepare annotations
+                    if show_support:
+                        # Create annotation matrix
+                        annot_m1 = np.empty(sub_m1.shape, dtype=object)
+                        annot_m5 = np.empty(sub_m5.shape, dtype=object)
+                        for r in range(sub_m1.shape[0]):
+                            for c in range(sub_m1.shape[1]):
+                                count = int(sub_counts[r, c])
+                                val1 = sub_m1[r, c]
+                                val5 = sub_m5[r, c]
+
+                                if np.isnan(val1):
+                                    annot_m1[r, c] = ""
+                                else:
+                                    annot_m1[r, c] = f"{val1:.1%}\n({count})"
+
+                                if np.isnan(val5):
+                                    annot_m5[r, c] = ""
+                                else:
+                                    annot_m5[r, c] = f"{val5:.1%}\n({count})"
+
+                        annot1 = annot_m1
+                        annot5 = annot_m5
+                        fmt = "" # format is handled in annot strings
+                    else:
+                        annot1 = True
+                        annot5 = True
+                        fmt = ".1%"
+
                     # Create Tabs for this group
                     mtab1, mtab2 = st.tabs([f"{grp} Top-1", f"{grp} Top-5"])
                     
@@ -501,8 +536,8 @@ with tab1:
                     fig1, ax1 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
                     sns.heatmap(
                         sub_m1,
-                        annot=True,
-                        fmt=".1%",
+                        annot=annot1,
+                        fmt=fmt,
                         xticklabels=sub_tags_col,
                         yticklabels=sub_tags_row,
                         cmap="Blues",
@@ -520,8 +555,8 @@ with tab1:
                     fig2, ax2 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
                     sns.heatmap(
                         sub_m5,
-                        annot=True,
-                        fmt=".1%",
+                        annot=annot5,
+                        fmt=fmt,
                         xticklabels=sub_tags_col,
                         yticklabels=sub_tags_row,
                         cmap="Blues",

@@ -9,7 +9,7 @@ This project is a CLIP Evaluation Tool designed to assess the performance of CLI
 -   **Data Loading:** Loads images and text labels from a specified directory. Uses a mapping JSON to link images to their ground truth text.
 -   **Filtering:** Allows users to filter the dataset based on pre-defined attributes (e.g., "Time: Day", "Person Size: Large") stored in a filter JSON file.
 -   **Metrics:** Calculates **Global Top-1 Accuracy** for Image-to-Text (I2T) retrieval.
--   **Matrix Analysis:** Breaks down accuracy by attribute values (e.g., accuracy for "Day" vs. "Night").
+-   **Matrix Analysis:** Breaks down accuracy by attribute values (e.g., accuracy for "Day" vs. "Night"). Includes a default "All" view and optional "Support (Count)" overlay.
 -   **History Saving:** Automatically saves every run's results to `history/run_{timestamp}.json`.
 -   **Note on T2I:** While the backend (`src/metrics.py`) contains logic for Text-to-Image (T2I) metrics, the current UI primarily exposes and runs Image-to-Text (I2T) evaluation.
 
