@@ -32,7 +32,7 @@ st.sidebar.title("Configuration")
 dataset_dir = st.sidebar.text_input("Dataset Directory", "data")
 model_name = st.sidebar.text_input("Model Name/ID", "MobileCLIP-S2")
 pretrained_tag = st.sidebar.text_input("Pretrained Tag", "openai")
-filter_json_path = st.sidebar.text_input("Filter JSON Path", "filter_attributes.json")
+filter_json_path = st.sidebar.text_input("Tag JSON Path", "filter_attributes.json")
 mapping_path = st.sidebar.text_input("Mapping JSON Path", "mapping.json")
 
 st.sidebar.markdown("### Auto-labeling Config")
@@ -132,13 +132,13 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
             filtered_items.append(item)
 
     if not filtered_items:
-        return None, "No items match the selected filters."
+        return None, "No items match the selected tags."
 
     # Prepare logic
     unique_texts = get_unique_texts(filtered_items)
 
     # Load Model
-    model = CLIPModel(model_name, pretrained_tag if pretrained_tag else None, None, device, "eval_cache.pt")
+    model = CLIPModel(model_name, None, pretrained_tag, device, "eval_cache.pt")
     model.load()
 
     # Encode
@@ -227,9 +227,10 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         for item in filtered_items:
             tags = set()
             for k, v in item.attributes.items():
-                tag = f"{k}: {v}"
-                tags.add(tag)
-                all_tags.add(tag)
+                if k != 'filename':
+                    tag = f"{k}: {v}"
+                    tags.add(tag)
+                    all_tags.add(tag)
             sample_tags.append(tags)
     else:
         for idx, text in enumerate(unique_texts):
@@ -238,9 +239,10 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
             for oid in origin_indices:
                 item = filtered_items[oid]
                 for k, v in item.attributes.items():
-                    tag = f"{k}: {v}"
-                    tags.add(tag)
-                    all_tags.add(tag)
+                    if k != 'filename':
+                        tag = f"{k}: {v}"
+                        tags.add(tag)
+                        all_tags.add(tag)
             sample_tags.append(tags)
 
     sorted_tags = sorted(list(all_tags))
@@ -264,10 +266,20 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
 
     matrix_top1 = []
     matrix_top5 = []
+    matrix_counts = [] # Added for mixing heatmap
 
+    # This loop generates the FULL matrix (all vs all)
+    # We will still compute it for completeness in 'cross_results' if needed,
+    # or we can just compute the sub-matrices for display.
+    # The existing code computes the full NxN.
+    # We can keep it to support the "old" view if needed, or just for data structure consistency.
+    
+    print(sorted_tags)
+    
     for t1 in sorted_tags:
         row1 = []
         row5 = []
+        row_c = []
         for t2 in sorted_tags:
             key = (t1, t2)
             if key in cross_matrix_data:
@@ -276,17 +288,48 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
                 avg5 = d["sum5"] / d["count"]
                 row1.append(avg1)
                 row5.append(avg5)
+                row_c.append(d["count"])
             else:
-                row1.append(np.nan) # Use np.nan instead of None
+                row1.append(np.nan) 
                 row5.append(np.nan)
+                row_c.append(0)
         matrix_top1.append(row1)
         matrix_top5.append(row5)
+        matrix_counts.append(row_c)
+
+    # Collect per-tag stats (diagonal)
+    tag_stats = []
+    for t in sorted_tags:
+        key = (t, t)
+        if key in cross_matrix_data:
+            d = cross_matrix_data[key]
+            acc1 = d["sum1"] / d["count"]
+            acc5 = d["sum5"] / d["count"]
+            tag_stats.append({
+                "Tag": t,
+                "Count": d["count"],
+                "ACC1": acc1,
+                "ACC5": acc5
+            })
 
     cross_results = {
         "tags": sorted_tags,
         "matrix_top1": matrix_top1,
-        "matrix_top5": matrix_top5
+        "matrix_top5": matrix_top5,
+        "matrix_counts": matrix_counts, 
+        "tag_stats": tag_stats 
     }
+
+    # Identify Tag Groups
+    # Extract keys from "Key: Value" tags
+    tag_groups = {}
+    for t in sorted_tags:
+        if ": " in t:
+            k, v = t.split(": ", 1)
+            if k not in tag_groups: tag_groups[k] = []
+            tag_groups[k].append(t)
+    
+    cross_results["tag_groups"] = tag_groups
 
     results = {
         "metrics": metrics,
@@ -356,12 +399,12 @@ with tab1:
                 filter_options[k].add(v)
 
         # Display Filters
-        st.subheader("Filters")
+        st.subheader("Tags")
         selected_filters = {}
         cols = st.columns(len(filter_options) if filter_options else 1)
         for i, (k, vals) in enumerate(filter_options.items()):
             with cols[i % len(cols)]:
-                selected_vals = st.multiselect(f"Filter by {k}", sorted(list(vals)))
+                selected_vals = st.multiselect(f"Tag by {k}", sorted(list(vals)))
                 selected_filters[k] = selected_vals
 
         if st.button("Run Evaluation"):
@@ -387,59 +430,119 @@ with tab1:
             c1.metric("Global Top-1", f"{m['global_top1']*100:.2f}%")
             c2.metric("Global Top-5", f"{m['global_top5']*100:.2f}%")
 
-            st.subheader("Cross-Filter Accuracy Matrix")
-
+            # --- Tag Performance Table ---
             cross = res.get("cross_results", {})
+            tag_stats = cross.get("tag_stats", [])
+            if tag_stats:
+                st.subheader("Tag Performance")
+                df_stats = pd.DataFrame(tag_stats)
+                # Format percentages
+                df_stats["ACC1"] = df_stats["ACC1"].apply(lambda x: f"{x:.2%}")
+                df_stats["ACC5"] = df_stats["ACC5"].apply(lambda x: f"{x:.2%}")
+                st.dataframe(df_stats)
+
+            # --- Tag Mixing Matrix ---
+            st.subheader("Tag Mixing Matrix (Accuracy)")
+            
             tags = cross.get("tags", [])
+            tag_groups = cross.get("tag_groups", {})
+            print(f"Tag Groups Found: {tag_groups.keys()}")
             m1 = cross.get("matrix_top1", [])
             m5 = cross.get("matrix_top5", [])
+            ts_str = res.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
 
-            if tags:
-                # Ensure data is numeric (handle None from JSON reload or previous state)
-                # If we loaded from JSON, Nones are present.
-                # If we just ran, NaNs are present.
-                # Seaborn needs floats. None/NaN are fine for missing data if dtype is float.
-
+            if tags and m1:
                 def to_float_array(arr):
-                    # Convert None to NaN and ensure float dtype
-                    narr = np.array(arr, dtype=object) # Start as object to handle None
+                    narr = np.array(arr, dtype=object) 
                     narr[narr == None] = np.nan
                     return narr.astype(float)
 
                 m1_arr = to_float_array(m1)
                 m5_arr = to_float_array(m5)
 
-                mtab1, mtab2 = st.tabs(["Top-1 Accuracy", "Top-5 Accuracy"])
+                # Iterate over groups to create sub-matrices
+                # If no groups found (no ": " in tags), fallback to full matrix?
+                # The prompt implies structured tags. If simple tags, maybe just one group.
+                
+                groups_to_plot = list(tag_groups.keys()) if tag_groups else ["All"]
+                
+                for grp in groups_to_plot:
+                    print(f"Processing group: {grp}")
+                    st.markdown(f"#### Group: {grp}")
+                    
+                    if grp == "All":
+                         row_indices = range(len(tags))
+                         col_indices = range(len(tags))
+                         sub_tags_row = tags
+                         sub_tags_col = tags
+                    else:
+                        # Row indices: tags in this group
+                        row_indices = [i for i, t in enumerate(tags) if t in tag_groups[grp]]
+                        # Col indices: tags NOT in this group
+                        col_indices = [i for i, t in enumerate(tags) if t not in tag_groups[grp]]
+                        
+                        sub_tags_row = [tags[i] for i in row_indices]
+                        sub_tags_col = [tags[i] for i in col_indices]
+                    
+                    if not row_indices or not col_indices:
+                        st.write("No interactions with outside groups.")
+                        continue
 
-                with mtab1:
-                    fig, ax = plt.subplots(figsize=(10, 8))
+                    # Extract sub-arrays
+                    # m1_arr[row_indices, :][:, col_indices]
+                    # numpy advanced indexing
+                    sub_m1 = m1_arr[np.ix_(row_indices, col_indices)]
+                    sub_m5 = m5_arr[np.ix_(row_indices, col_indices)]
+                    
+                    # Create Tabs for this group
+                    mtab1, mtab2 = st.tabs([f"{grp} Top-1", f"{grp} Top-5"])
+                    
+                    # Generate and Save Top-1
+                    fig1, ax1 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
                     sns.heatmap(
-                        m1_arr,
+                        sub_m1,
                         annot=True,
                         fmt=".1%",
-                        xticklabels=tags,
-                        yticklabels=tags,
+                        xticklabels=sub_tags_col,
+                        yticklabels=sub_tags_row,
                         cmap="Blues",
-                        ax=ax,
+                        ax=ax1,
                         vmin=0, vmax=1
                     )
                     plt.xticks(rotation=45, ha="right")
-                    st.pyplot(fig)
-
-                with mtab2:
-                    fig, ax = plt.subplots(figsize=(10, 8))
+                    plt.title(f"{grp} Interaction Top-1")
+                    
+                    safe_grp = grp.replace(" ", "_").replace("/", "_")
+                    path_top1 = os.path.join(HISTORY_DIR, f"heatmap_{safe_grp}_top1_{ts_str}.png")
+                    plt.savefig(path_top1, bbox_inches="tight")
+                    
+                    # Generate and Save Top-5
+                    fig2, ax2 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
                     sns.heatmap(
-                        m5_arr,
+                        sub_m5,
                         annot=True,
                         fmt=".1%",
-                        xticklabels=tags,
-                        yticklabels=tags,
+                        xticklabels=sub_tags_col,
+                        yticklabels=sub_tags_row,
                         cmap="Blues",
-                        ax=ax,
+                        ax=ax2,
                         vmin=0, vmax=1
                     )
                     plt.xticks(rotation=45, ha="right")
-                    st.pyplot(fig)
+                    plt.title(f"{grp} Interaction Top-5")
+                    
+                    path_top5 = os.path.join(HISTORY_DIR, f"heatmap_{safe_grp}_top5_{ts_str}.png")
+                    plt.savefig(path_top5, bbox_inches="tight")
+                    
+                    with mtab1:
+                        st.image(path_top1)
+                    with mtab2:
+                        st.image(path_top5)
+
+                    plt.close(fig1)
+                    plt.close(fig2)
+                    print(f"Finished group: {grp}")
+
 
 with tab2:
     st.header("Debug View")
@@ -530,7 +633,7 @@ with tab4:
             html_content += "</head><body><h1>Comparison Report</h1>"
 
             # Summary Table
-            html_content += "<h2>Summary</h2><table><tr><th>Run</th><th>Mode</th><th>Model</th><th>Samples</th><th>Global Top-1</th><th>Global Top-5</th><th>Filters</th></tr>"
+            html_content += "<h2>Summary</h2><table><tr><th>Run</th><th>Mode</th><th>Model</th><th>Samples</th><th>Global Top-1</th><th>Global Top-5</th><th>Active Tags</th></tr>"
             for d in comparison_data:
                 filters_str = ", ".join([f"{k}:{v}" for k,v in d.get("filters", {}).items() if v])
                 mode_str = d.get("mode", "i2t") # default for old runs
