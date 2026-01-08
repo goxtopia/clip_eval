@@ -220,10 +220,7 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         debug_dir = save_debug_cases(filtered_items, bad_cases, mode, timestamp)
 
     # --- Cross-Attribute Matrix Calculation ---
-    # 1. Identify all unique Tags (combinations of Key:Value)
-    # We assign tags to each sample (index i of performance_records)
-
-    sample_tags = [] # list of sets of tags for each sample
+    sample_tags = []
     all_tags = set()
 
     if mode == "i2t":
@@ -235,14 +232,9 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
                 all_tags.add(tag)
             sample_tags.append(tags)
     else:
-        # T2I: map query -> items -> attributes
-        # performance_records aligned with unique_texts
         for idx, text in enumerate(unique_texts):
             origin_indices = text_to_item_indices.get(text, [])
             tags = set()
-            # Aggregate tags from all representative items? Or just intersection?
-            # Or union? Let's do union of attributes from all items that share this text.
-            # This means if one image is "Day" and another is "Night" for same text, the query gets both tags.
             for oid in origin_indices:
                 item = filtered_items[oid]
                 for k, v in item.attributes.items():
@@ -252,24 +244,12 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
             sample_tags.append(tags)
 
     sorted_tags = sorted(list(all_tags))
-    n_tags = len(sorted_tags)
 
-    # Initialize Matrices
-    # We will store raw counts and sums to compute means
-    # Cells: (sum_top1, sum_top5, count)
     cross_matrix_data = {} # Key: (tag_i, tag_j) -> {sum1, sum5, count}
 
     for i in range(len(performance_records)):
         p_rec = performance_records[i]
         tags = sample_tags[i]
-
-        # Add "All" tag for global intersection? No, user asked for filter possibilities.
-
-        # Double loop over tags present in this sample
-        # Note: We need to populate the full N x N matrix.
-        # So we iterate over all unique tags? No, that's O(N^2 * Samples).
-        # Better: iterate over pairs of tags present in the sample.
-        # If a sample has tags {A, B}, it contributes to (A, A), (B, B), (A, B), (B, A).
 
         tags_list = list(tags)
         for t1 in tags_list:
@@ -281,10 +261,6 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
                 cross_matrix_data[key]["sum1"] += p_rec[0]
                 cross_matrix_data[key]["sum5"] += p_rec[1]
                 cross_matrix_data[key]["count"] += 1
-
-    # Convert to simple 2D arrays for plotting
-    # We use sorted_tags for indexing
-    # If a pair (Ti, Tj) has no data, it remains None/NaN
 
     matrix_top1 = []
     matrix_top5 = []
@@ -301,8 +277,8 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
                 row1.append(avg1)
                 row5.append(avg5)
             else:
-                row1.append(None) # Empty intersection
-                row5.append(None)
+                row1.append(np.nan) # Use np.nan instead of None
+                row5.append(np.nan)
         matrix_top1.append(row1)
         matrix_top5.append(row5)
 
@@ -330,7 +306,22 @@ def save_run(results):
     fname = f"run_{ts}.json"
     path = os.path.join(HISTORY_DIR, fname)
     with open(path, "w") as f:
-        json.dump(results, f, indent=4)
+        # We need to handle np.nan for JSON dump
+        # json.dump doesn't like NaN by default or it dumps as NaN which might be valid in some parsers but standard says no.
+        # Python's json dump will dump NaN as NaN, but strictly it's not valid JSON.
+        # However, for internal read back it might be fine, or we can convert to null.
+        # Let's clean NaN to None (null) before saving.
+
+        def clean_nans(obj):
+            if isinstance(obj, list):
+                return [clean_nans(x) for x in obj]
+            if isinstance(obj, dict):
+                return {k: clean_nans(v) for k, v in obj.items()}
+            if isinstance(obj, float) and np.isnan(obj):
+                return None
+            return obj
+
+        json.dump(clean_nans(results), f, indent=4)
     return path
 
 # --- Tabs ---
@@ -404,12 +395,26 @@ with tab1:
             m5 = cross.get("matrix_top5", [])
 
             if tags:
+                # Ensure data is numeric (handle None from JSON reload or previous state)
+                # If we loaded from JSON, Nones are present.
+                # If we just ran, NaNs are present.
+                # Seaborn needs floats. None/NaN are fine for missing data if dtype is float.
+
+                def to_float_array(arr):
+                    # Convert None to NaN and ensure float dtype
+                    narr = np.array(arr, dtype=object) # Start as object to handle None
+                    narr[narr == None] = np.nan
+                    return narr.astype(float)
+
+                m1_arr = to_float_array(m1)
+                m5_arr = to_float_array(m5)
+
                 mtab1, mtab2 = st.tabs(["Top-1 Accuracy", "Top-5 Accuracy"])
 
                 with mtab1:
                     fig, ax = plt.subplots(figsize=(10, 8))
                     sns.heatmap(
-                        m1,
+                        m1_arr,
                         annot=True,
                         fmt=".1%",
                         xticklabels=tags,
@@ -424,7 +429,7 @@ with tab1:
                 with mtab2:
                     fig, ax = plt.subplots(figsize=(10, 8))
                     sns.heatmap(
-                        m5,
+                        m5_arr,
                         annot=True,
                         fmt=".1%",
                         xticklabels=tags,
@@ -549,25 +554,6 @@ with tab4:
             html_content += "</table>"
 
             # Detailed Matrix Comparison
-            # Since we moved to Cross-Matrix, we might want to show that here too?
-            # Or just summary stats per attribute?
-            # The user asked for "matrix results", previously I did per-attribute breakdown.
-            # I will keep the per-attribute breakdown for the report for now, as plotting N heatmaps in HTML is hard without images.
-            # I will try to support the old matrix_results structure if present, or infer from cross-matrix?
-            # For backward compatibility, I kept matrix_results in run_evaluation?
-            # Oh, I removed `matrix_results` calculation in run_evaluation in favor of `cross_results`.
-            # I should probably ADD BACK `matrix_results` (per attribute stats) because it's useful for simple reporting.
-
-            # Re-adding per-attribute stats logic to report?
-            # No, I removed it from run_evaluation.
-            # I will assume for now the user is happy with the app visualization of the cross matrix.
-            # But the report generation code relies on `matrix_results`.
-            # I should fix `run_evaluation` to ALSO include `matrix_results` (per-attribute summaries)
-            # because the Diagonal of the cross-matrix essentially gives the per-attribute stats (intersect with itself).
-
-            # Let's see if I can reconstruct it from cross results in the report generation?
-            # Yes, if I look for (TagA, TagA) in cross matrix, that is the accuracy for TagA.
-
             html_content += "<h2>Attribute Performance (Derived from Cross-Matrix)</h2>"
 
             # Collect all unique tags across runs
@@ -597,10 +583,15 @@ with tab4:
                         if tag in tags:
                             idx = tags.index(tag)
                             # Diagonal
-                            t1 = d["cross_results"]["matrix_top1"][idx][idx]
-                            t5 = d["cross_results"]["matrix_top5"][idx][idx]
-                            # Count? We didn't save count in matrix arrays, only means.
-                            # We can't show count easily unless we save it.
+                            # Handle potential None/NaN if data came from json or in memory
+                            # The json loader loads null as None.
+                            m1_val = d["cross_results"]["matrix_top1"][idx][idx]
+                            m5_val = d["cross_results"]["matrix_top5"][idx][idx]
+
+                            if m1_val is not None:
+                                t1 = float(m1_val)
+                                t5 = float(m5_val) if m5_val is not None else 0.0
+
                     elif "matrix_results" in d:
                         # Parse tag "Attr: Val"
                         if ": " in tag:
