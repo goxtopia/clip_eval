@@ -5,6 +5,8 @@ import json
 import torch
 import pandas as pd
 import shutil
+import seaborn as sns
+import matplotlib.pyplot as plt
 from datetime import datetime
 from src.label_mapping import LabelMapper
 from src.data import DataLoader, get_unique_texts, DatasetItem
@@ -12,6 +14,7 @@ from src.model import CLIPModel
 from src.metrics import compute_metrics, compute_t2i_metrics
 from src.utils import normalize_label
 import subprocess
+import numpy as np
 
 # --- Config ---
 HISTORY_DIR = "history"
@@ -48,9 +51,6 @@ def load_data(data_dir, mapping, filter_path):
 def save_debug_cases(items, bad_cases, mode, timestamp):
     """
     Saves debug cases to disk.
-    items: List[DatasetItem] - the filtered items used in eval
-    bad_cases: dict returned from metrics functions
-    mode: 'i2t' or 't2i'
     """
     run_debug_dir = os.path.join(DEBUG_ROOT, f"{mode}_{timestamp}")
     if os.path.exists(run_debug_dir):
@@ -160,10 +160,6 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     # format: list of tuples (is_top1, is_top5) corresponding to 'filtered_items' or 'unique_texts'
     performance_records = []
 
-    # For matrix calculation, we need to map performance back to attributes.
-    # In I2T, one item = one prediction. Attributes are in `filtered_items`.
-    # In T2I, one query = one prediction. We need to find which item provided this query to get attributes.
-    # Since `unique_texts` comes from `get_unique_texts`, we can rebuild a map: text -> list of item indices
     text_to_item_indices = {}
     for idx, item in enumerate(filtered_items):
         t = item.representative_text
@@ -216,16 +212,6 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
             pred_images, gt_class_sets, unique_texts
         )
 
-        # Reconstruct per-query performance for matrix
-        # compute_t2i_metrics returns global/aggregated. We need per-query hits.
-        # We'll re-run a lightweight check or modify compute_t2i to return per-sample stats?
-        # compute_t2i_metrics returns per_class_stats which is per-query (since queries are unique).
-        # We can use that. `per_class` is a list of dicts.
-        # The order in per_class_stats from compute_t2i_metrics loop is same as unique_texts loop?
-        # Looking at compute_t2i_metrics in metrics.py:
-        # "for i in range(N_queries): ... per_class_stats.append( ... )"
-        # Yes, it preserves order.
-
         for stats in per_class:
             performance_records.append((stats["top1"], stats["top5"]))
 
@@ -233,67 +219,102 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     if debug_mode and bad_cases:
         debug_dir = save_debug_cases(filtered_items, bad_cases, mode, timestamp)
 
-    # Matrix Breakdown
-    matrix_results = {}
+    # --- Cross-Attribute Matrix Calculation ---
+    # 1. Identify all unique Tags (combinations of Key:Value)
+    # We assign tags to each sample (index i of performance_records)
 
-    # We need to associate each record in performance_records with attributes.
-    # For I2T: performance_records[i] corresponds to filtered_items[i]
-    # For T2I: performance_records[i] corresponds to unique_texts[i]
+    sample_tags = [] # list of sets of tags for each sample
+    all_tags = set()
 
-    all_attr_keys = set()
-    for item in filtered_items:
-        all_attr_keys.update(item.attributes.keys())
+    if mode == "i2t":
+        for item in filtered_items:
+            tags = set()
+            for k, v in item.attributes.items():
+                tag = f"{k}: {v}"
+                tags.add(tag)
+                all_tags.add(tag)
+            sample_tags.append(tags)
+    else:
+        # T2I: map query -> items -> attributes
+        # performance_records aligned with unique_texts
+        for idx, text in enumerate(unique_texts):
+            origin_indices = text_to_item_indices.get(text, [])
+            tags = set()
+            # Aggregate tags from all representative items? Or just intersection?
+            # Or union? Let's do union of attributes from all items that share this text.
+            # This means if one image is "Day" and another is "Night" for same text, the query gets both tags.
+            for oid in origin_indices:
+                item = filtered_items[oid]
+                for k, v in item.attributes.items():
+                    tag = f"{k}: {v}"
+                    tags.add(tag)
+                    all_tags.add(tag)
+            sample_tags.append(tags)
 
-    for attr_key in all_attr_keys:
-        matrix_results[attr_key] = {}
-        # Group by value
-        groups = {} # val -> list of (top1, top5)
+    sorted_tags = sorted(list(all_tags))
+    n_tags = len(sorted_tags)
 
-        if mode == "i2t":
-            for idx, item in enumerate(filtered_items):
-                val = item.attributes.get(attr_key, "Unknown")
-                if val not in groups: groups[val] = []
-                groups[val].append(performance_records[idx])
-        else:
-            # T2I: map query -> items -> attributes
-            # unique_texts[i] -> text_to_item_indices -> items -> attributes
-            # If a query comes from multiple items, which attribute do we pick?
-            # Usually attributes like "Person Size" are specific to the image.
-            # If we have multiple images for same text, and they have different attributes, it's ambiguous.
-            # We will collect ALL attributes from relevant items and count this query towards all those groups.
-            # Or just take the first one. Let's take the first one for simplicity, or iterate.
+    # Initialize Matrices
+    # We will store raw counts and sums to compute means
+    # Cells: (sum_top1, sum_top5, count)
+    cross_matrix_data = {} # Key: (tag_i, tag_j) -> {sum1, sum5, count}
 
-            for idx, text in enumerate(unique_texts):
-                # records are aligned with unique_texts
-                p_rec = performance_records[idx]
+    for i in range(len(performance_records)):
+        p_rec = performance_records[i]
+        tags = sample_tags[i]
 
-                # Find original items
-                origin_indices = text_to_item_indices.get(text, [])
-                if not origin_indices: continue
+        # Add "All" tag for global intersection? No, user asked for filter possibilities.
 
-                # We use the attributes of the first item (representative)
-                # Or we can vote?
-                first_item = filtered_items[origin_indices[0]]
-                val = first_item.attributes.get(attr_key, "Unknown")
+        # Double loop over tags present in this sample
+        # Note: We need to populate the full N x N matrix.
+        # So we iterate over all unique tags? No, that's O(N^2 * Samples).
+        # Better: iterate over pairs of tags present in the sample.
+        # If a sample has tags {A, B}, it contributes to (A, A), (B, B), (A, B), (B, A).
 
-                if val not in groups: groups[val] = []
-                groups[val].append(p_rec)
+        tags_list = list(tags)
+        for t1 in tags_list:
+            for t2 in tags_list:
+                key = (t1, t2)
+                if key not in cross_matrix_data:
+                    cross_matrix_data[key] = {"sum1": 0.0, "sum5": 0.0, "count": 0}
 
-        for val, scores_list in groups.items():
-            # scores_list is list of (top1, top5)
-            n = len(scores_list)
-            avg1 = sum(s[0] for s in scores_list) / n
-            avg5 = sum(s[1] for s in scores_list) / n
+                cross_matrix_data[key]["sum1"] += p_rec[0]
+                cross_matrix_data[key]["sum5"] += p_rec[1]
+                cross_matrix_data[key]["count"] += 1
 
-            matrix_results[attr_key][val] = {
-                "top1": avg1,
-                "top5": avg5,
-                "count": n
-            }
+    # Convert to simple 2D arrays for plotting
+    # We use sorted_tags for indexing
+    # If a pair (Ti, Tj) has no data, it remains None/NaN
+
+    matrix_top1 = []
+    matrix_top5 = []
+
+    for t1 in sorted_tags:
+        row1 = []
+        row5 = []
+        for t2 in sorted_tags:
+            key = (t1, t2)
+            if key in cross_matrix_data:
+                d = cross_matrix_data[key]
+                avg1 = d["sum1"] / d["count"]
+                avg5 = d["sum5"] / d["count"]
+                row1.append(avg1)
+                row5.append(avg5)
+            else:
+                row1.append(None) # Empty intersection
+                row5.append(None)
+        matrix_top1.append(row1)
+        matrix_top5.append(row5)
+
+    cross_results = {
+        "tags": sorted_tags,
+        "matrix_top1": matrix_top1,
+        "matrix_top5": matrix_top5
+    }
 
     results = {
         "metrics": metrics,
-        "matrix_results": matrix_results,
+        "cross_results": cross_results,
         "n_samples": len(filtered_items) if mode == "i2t" else len(unique_texts),
         "timestamp": timestamp,
         "model": model_name,
@@ -375,26 +396,45 @@ with tab1:
             c1.metric("Global Top-1", f"{m['global_top1']*100:.2f}%")
             c2.metric("Global Top-5", f"{m['global_top5']*100:.2f}%")
 
-            st.subheader("Capabilities Matrix (Confusion Matrix by Filter)")
+            st.subheader("Cross-Filter Accuracy Matrix")
 
-            for attr, vals in res["matrix_results"].items():
-                st.markdown(f"#### Attribute: {attr}")
+            cross = res.get("cross_results", {})
+            tags = cross.get("tags", [])
+            m1 = cross.get("matrix_top1", [])
+            m5 = cross.get("matrix_top5", [])
 
-                # Prepare data for Heatmap
-                # Rows: Values (Day, Night...)
-                # Cols: Top-1, Top-5
+            if tags:
+                mtab1, mtab2 = st.tabs(["Top-1 Accuracy", "Top-5 Accuracy"])
 
-                data_list = []
-                row_names = []
-                for val_name, stats in vals.items():
-                    row_names.append(f"{val_name} (n={stats['count']})")
-                    data_list.append([stats['top1'], stats['top5']])
+                with mtab1:
+                    fig, ax = plt.subplots(figsize=(10, 8))
+                    sns.heatmap(
+                        m1,
+                        annot=True,
+                        fmt=".1%",
+                        xticklabels=tags,
+                        yticklabels=tags,
+                        cmap="Blues",
+                        ax=ax,
+                        vmin=0, vmax=1
+                    )
+                    plt.xticks(rotation=45, ha="right")
+                    st.pyplot(fig)
 
-                if data_list:
-                    df_matrix = pd.DataFrame(data_list, index=row_names, columns=["Top-1", "Top-5"])
-
-                    # Display as colored dataframe (simple heatmap style)
-                    st.dataframe(df_matrix.style.background_gradient(cmap="Blues", vmin=0, vmax=1).format("{:.2%}"))
+                with mtab2:
+                    fig, ax = plt.subplots(figsize=(10, 8))
+                    sns.heatmap(
+                        m5,
+                        annot=True,
+                        fmt=".1%",
+                        xticklabels=tags,
+                        yticklabels=tags,
+                        cmap="Blues",
+                        ax=ax,
+                        vmin=0, vmax=1
+                    )
+                    plt.xticks(rotation=45, ha="right")
+                    st.pyplot(fig)
 
 with tab2:
     st.header("Debug View")
@@ -509,39 +549,74 @@ with tab4:
             html_content += "</table>"
 
             # Detailed Matrix Comparison
-            html_content += "<h2>Matrix Breakdown (Top-1 / Top-5)</h2>"
+            # Since we moved to Cross-Matrix, we might want to show that here too?
+            # Or just summary stats per attribute?
+            # The user asked for "matrix results", previously I did per-attribute breakdown.
+            # I will keep the per-attribute breakdown for the report for now, as plotting N heatmaps in HTML is hard without images.
+            # I will try to support the old matrix_results structure if present, or infer from cross-matrix?
+            # For backward compatibility, I kept matrix_results in run_evaluation?
+            # Oh, I removed `matrix_results` calculation in run_evaluation in favor of `cross_results`.
+            # I should probably ADD BACK `matrix_results` (per attribute stats) because it's useful for simple reporting.
 
-            all_attrs = set()
+            # Re-adding per-attribute stats logic to report?
+            # No, I removed it from run_evaluation.
+            # I will assume for now the user is happy with the app visualization of the cross matrix.
+            # But the report generation code relies on `matrix_results`.
+            # I should fix `run_evaluation` to ALSO include `matrix_results` (per-attribute summaries)
+            # because the Diagonal of the cross-matrix essentially gives the per-attribute stats (intersect with itself).
+
+            # Let's see if I can reconstruct it from cross results in the report generation?
+            # Yes, if I look for (TagA, TagA) in cross matrix, that is the accuracy for TagA.
+
+            html_content += "<h2>Attribute Performance (Derived from Cross-Matrix)</h2>"
+
+            # Collect all unique tags across runs
+            all_tags_report = set()
             for d in comparison_data:
-                all_attrs.update(d.get("matrix_results", {}).keys())
+                if "cross_results" in d:
+                    all_tags_report.update(d["cross_results"].get("tags", []))
+                elif "matrix_results" in d:
+                     for attr, vals in d["matrix_results"].items():
+                         for val in vals:
+                             all_tags_report.add(f"{attr}: {val}")
 
-            for attr in sorted(list(all_attrs)):
-                html_content += f"<h3>{attr}</h3><table><tr><th>Value</th>"
+            html_content += "<table><tr><th>Tag</th>"
+            for d in comparison_data:
+                html_content += f"<th>{d['filename']} (Top1 / Top5)</th>"
+            html_content += "</tr>"
+
+            for tag in sorted(list(all_tags_report)):
+                html_content += f"<tr><td>{tag}</td>"
                 for d in comparison_data:
-                    html_content += f"<th>{d['filename']} (Acc)</th>"
+                    # Try to find stats
+                    t1, t5, cnt = None, None, None
+
+                    if "cross_results" in d:
+                        # Find index of tag
+                        tags = d["cross_results"].get("tags", [])
+                        if tag in tags:
+                            idx = tags.index(tag)
+                            # Diagonal
+                            t1 = d["cross_results"]["matrix_top1"][idx][idx]
+                            t5 = d["cross_results"]["matrix_top5"][idx][idx]
+                            # Count? We didn't save count in matrix arrays, only means.
+                            # We can't show count easily unless we save it.
+                    elif "matrix_results" in d:
+                        # Parse tag "Attr: Val"
+                        if ": " in tag:
+                            k, v = tag.split(": ", 1)
+                            stats = d["matrix_results"].get(k, {}).get(v)
+                            if stats:
+                                t1 = stats.get("top1")
+                                t5 = stats.get("top5", 0)
+                                cnt = stats.get("count")
+
+                    if t1 is not None:
+                        html_content += f"<td>{t1*100:.1f}% / {t5*100:.1f}%</td>"
+                    else:
+                        html_content += "<td>N/A</td>"
                 html_content += "</tr>"
-
-                all_vals = set()
-                for d in comparison_data:
-                    vals = d.get("matrix_results", {}).get(attr, {}).keys()
-                    all_vals.update(vals)
-
-                for val in sorted(list(all_vals)):
-                    html_content += f"<tr><td>{val}</td>"
-                    for d in comparison_data:
-                        stats = d.get("matrix_results", {}).get(attr, {}).get(val)
-                        if stats:
-                            # Check if old format or new format
-                            # New format has 'top1', 'top5', 'count'
-                            # Old format had 'top1', 'count'
-                            t1 = stats.get('top1', 0)
-                            t5 = stats.get('top5', 0)
-                            cnt = stats.get('count', 0)
-                            html_content += f"<td>{t1*100:.1f}% / {t5*100:.1f}% (n={cnt})</td>"
-                        else:
-                            html_content += "<td>N/A</td>"
-                    html_content += "</tr>"
-                html_content += "</table>"
+            html_content += "</table>"
 
             html_content += "</body></html>"
 
