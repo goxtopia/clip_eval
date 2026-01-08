@@ -1,0 +1,32 @@
+# Python bytecode files
+*.pyc
+*.pyo
+__pycache__
+
+# Virtual environment
+.env/
+venv/
+env/
+
+# Chroma database
+chroma_db/
+
+# Log files
+*.log
+
+# ZIP files
+*.zip
+
+# IDE configurations
+.vscode/
+.idea/
+
+# Python package distribution
+*.egg
+*.egg-info
+dist/
+build/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
