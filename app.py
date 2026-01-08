@@ -421,35 +421,53 @@ with tab1:
                 st.dataframe(df_stats)
 
             # --- Tag Mixing Matrix ---
-            st.subheader("Tag Mixing Matrix")
+            st.subheader("Tag Mixing Matrix (Accuracy)")
 
             tags = cross.get("tags", [])
-            # Prioritize 'matrix_counts' if available, otherwise fallback (unlikely in new runs)
-            m_counts = cross.get("matrix_counts", [])
+            m1 = cross.get("matrix_top1", [])
+            m5 = cross.get("matrix_top5", [])
 
-            if tags and m_counts:
-                def to_int_array(arr):
-                     # Convert None to 0 and ensure int dtype
-                     # Actually seaborn heatmap needs numeric types.
-                     # Counts are integers.
-                     narr = np.array(arr, dtype=object)
-                     narr[narr == None] = 0
-                     return narr.astype(int)
+            if tags and m1:
+                def to_float_array(arr):
+                    # Convert None to NaN and ensure float dtype
+                    narr = np.array(arr, dtype=object)
+                    narr[narr == None] = np.nan
+                    return narr.astype(float)
 
-                m_counts_arr = to_int_array(m_counts)
+                m1_arr = to_float_array(m1)
+                m5_arr = to_float_array(m5)
 
-                fig, ax = plt.subplots(figsize=(10, 8))
-                sns.heatmap(
-                    m_counts_arr,
-                    annot=True,
-                    fmt="d",
-                    xticklabels=tags,
-                    yticklabels=tags,
-                    cmap="Blues",
-                    ax=ax
-                )
-                plt.xticks(rotation=45, ha="right")
-                st.pyplot(fig)
+                mtab1, mtab2 = st.tabs(["Top-1 Accuracy", "Top-5 Accuracy"])
+
+                with mtab1:
+                    fig, ax = plt.subplots(figsize=(10, 8))
+                    sns.heatmap(
+                        m1_arr,
+                        annot=True,
+                        fmt=".1%",
+                        xticklabels=tags,
+                        yticklabels=tags,
+                        cmap="Blues",
+                        ax=ax,
+                        vmin=0, vmax=1
+                    )
+                    plt.xticks(rotation=45, ha="right")
+                    st.pyplot(fig)
+
+                with mtab2:
+                    fig, ax = plt.subplots(figsize=(10, 8))
+                    sns.heatmap(
+                        m5_arr,
+                        annot=True,
+                        fmt=".1%",
+                        xticklabels=tags,
+                        yticklabels=tags,
+                        cmap="Blues",
+                        ax=ax,
+                        vmin=0, vmax=1
+                    )
+                    plt.xticks(rotation=45, ha="right")
+                    st.pyplot(fig)
 
 with tab2:
     st.header("Debug View")
