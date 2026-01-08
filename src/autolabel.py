@@ -43,8 +43,20 @@ class AutoLabeler:
         return hash_md5.hexdigest()
 
     def _encode_image(self, image_path):
-        with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
+        img = cv2.imread(image_path)
+        if img is None:
+            return ""
+
+        h, w = img.shape[:2]
+        max_dim = max(h, w)
+        if max_dim > 1024:
+            scale = 1024 / max_dim
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img = cv2.resize(img, (new_w, new_h))
+
+        _, buffer = cv2.imencode('.jpg', img)
+        return base64.b64encode(buffer).decode('utf-8')
 
     def _get_person_size(self, image_path: str) -> str:
         try:
