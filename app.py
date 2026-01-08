@@ -119,7 +119,8 @@ def save_debug_cases(items, bad_cases, mode, timestamp):
 def run_evaluation(items, model_name, pretrained, device, selected_filters, mode="i2t", debug_mode=False):
     # Filter items
     filtered_items = []
-    for item in items:
+    filtered_indices = [] # Indices in the original 'items' list
+    for idx, item in enumerate(items):
         match = True
         for key, desired_values in selected_filters.items():
             if not desired_values: continue
@@ -130,19 +131,20 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
                 break
         if match:
             filtered_items.append(item)
+            filtered_indices.append(idx)
 
     if not filtered_items:
         return None, "No items match the selected filters."
 
-    # Prepare logic
-    unique_texts = get_unique_texts(filtered_items)
+    # Prepare logic using ALL items for matrix, but subset for metrics
+    unique_texts = get_unique_texts(items) # Use ALL items for unique texts
 
     # Load Model
     model = CLIPModel(model_name, pretrained_tag if pretrained_tag else None, None, device, "eval_cache.pt")
     model.load()
 
-    # Encode
-    image_paths = [item.image_path for item in filtered_items]
+    # Encode ALL items
+    image_paths = [item.image_path for item in items]
     image_features = model.encode_images(image_paths, 32)
 
     templates = ["{}"]
@@ -151,56 +153,65 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     image_features = image_features.to(device)
     text_features = text_features.to(device)
 
-    gt_class_sets = [item.gt_class_set for item in filtered_items]
+    # All GT sets
+    gt_class_sets = [item.gt_class_set for item in items]
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Store per-item hit status for ALL items for matrix breakdown
+    # format: list of tuples (is_top1, is_top5)
+    performance_records_all = []
 
     metrics = {}
     bad_cases = {}
 
-    # Store per-item (or per-query) hit status for matrix breakdown
-    # format: list of tuples (is_top1, is_top5) corresponding to 'filtered_items' or 'unique_texts'
-    performance_records = []
-
-    text_to_item_indices = {}
-    for idx, item in enumerate(filtered_items):
+    # Pre-compute text to item indices for T2I matrix
+    text_to_item_indices_all = {}
+    for idx, item in enumerate(items):
         t = item.representative_text
         if t:
-            if t not in text_to_item_indices: text_to_item_indices[t] = []
-            text_to_item_indices[t].append(idx)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    debug_dir = None
+            if t not in text_to_item_indices_all: text_to_item_indices_all[t] = []
+            text_to_item_indices_all[t].append(idx)
 
     if mode == "i2t":
+        # Calculate for ALL
         sims_i2t = image_features @ text_features.T
         k = min(5, sims_i2t.size(1))
         _, top_idx = sims_i2t.topk(k=k, dim=-1)
         pred_classes = top_idx.cpu()
 
-        class_to_images = {}
+        # 1. Global Metrics (Filtered Subset)
+        # Extract predictions for filtered indices
+        filtered_pred_classes = pred_classes[filtered_indices]
+        filtered_gt_sets = [gt_class_sets[i] for i in filtered_indices]
+
+        # We need class_to_images for the filtered subset for per-class metrics
+        class_to_images_filtered = {}
         for idx, item in enumerate(filtered_items):
             if not item.representative_text: continue
             rep_lbl = normalize_label(item.representative_text)
-            if rep_lbl not in class_to_images: class_to_images[rep_lbl] = []
-            class_to_images[rep_lbl].append(idx)
+            if rep_lbl not in class_to_images_filtered: class_to_images_filtered[rep_lbl] = []
+            class_to_images_filtered[rep_lbl].append(idx)
 
         metrics, per_class, bad_cases = compute_metrics(
-            pred_classes, gt_class_sets, unique_texts, class_to_images
+            filtered_pred_classes, filtered_gt_sets, unique_texts, class_to_images_filtered
         )
 
-        # Reconstruct per-item performance for matrix
+        # 2. Matrix Breakdown (All Items)
         candidate_norms = [normalize_label(t) for t in unique_texts]
-        for i in range(len(filtered_items)):
+
+        for i in range(len(items)):
             gset = gt_class_sets[i]
             preds_idx = pred_classes[i].tolist()
             pred_norms = [candidate_norms[p] for p in preds_idx]
 
             if not gset:
-                performance_records.append((0.0, 0.0))
+                performance_records_all.append((0.0, 0.0))
                 continue
 
             hit1 = 1.0 if pred_norms[0] in gset else 0.0
             hit5 = 1.0 if any(p in gset for p in pred_norms) else 0.0
-            performance_records.append((hit1, hit5))
+            performance_records_all.append((hit1, hit5))
 
     else: # T2I
         sims_t2i = text_features @ image_features.T
@@ -208,23 +219,50 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         _, top_idx = sims_t2i.topk(k=k, dim=-1)
         pred_images = top_idx.cpu()
 
+        # 1. Global Metrics (Filtered Subset)
+        # Map text to filtered items
+        filtered_unique_text_indices = []
+
+        for i, text in enumerate(unique_texts):
+            # Original indices of this text
+            original_indices = text_to_item_indices_all.get(text, [])
+            # Check overlap with filtered_indices
+            overlap = [oid for oid in original_indices if oid in filtered_indices]
+            if overlap:
+                filtered_unique_text_indices.append(i)
+
+        if not filtered_unique_text_indices:
+             return None, "No queries match the selected filters."
+
+        # Extract subset of pred_images (queries)
+        filtered_pred_images = pred_images[filtered_unique_text_indices]
+        filtered_queries = [unique_texts[i] for i in filtered_unique_text_indices]
+
         metrics, per_class, bad_cases = compute_t2i_metrics(
-            pred_images, gt_class_sets, unique_texts
+            filtered_pred_images, gt_class_sets, filtered_queries
         )
 
-        for stats in per_class:
-            performance_records.append((stats["top1"], stats["top5"]))
+        # 2. Matrix Breakdown (All Items)
+        # First compute metrics for all to get per-query hits
+        _, per_class_all, _ = compute_t2i_metrics(
+             pred_images, gt_class_sets, unique_texts
+        )
+        # per_class_all is list of stats, same order as unique_texts
+        for stats in per_class_all:
+            performance_records_all.append((stats["top1"], stats["top5"]))
 
     # Save Debug if enabled
+    debug_dir = None
     if debug_mode and bad_cases:
         debug_dir = save_debug_cases(filtered_items, bad_cases, mode, timestamp)
 
-    # --- Cross-Attribute Matrix Calculation ---
+    # --- Cross-Attribute Matrix Calculation (On ALL data) ---
     sample_tags = []
     all_tags = set()
 
     if mode == "i2t":
-        for item in filtered_items:
+        # performance_records_all matches 'items' (all)
+        for item in items:
             tags = set()
             for k, v in item.attributes.items():
                 tag = f"{k}: {v}"
@@ -232,11 +270,12 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
                 all_tags.add(tag)
             sample_tags.append(tags)
     else:
+        # performance_records_all matches 'unique_texts' (all)
         for idx, text in enumerate(unique_texts):
-            origin_indices = text_to_item_indices.get(text, [])
+            origin_indices = text_to_item_indices_all.get(text, [])
             tags = set()
             for oid in origin_indices:
-                item = filtered_items[oid]
+                item = items[oid]
                 for k, v in item.attributes.items():
                     tag = f"{k}: {v}"
                     tags.add(tag)
@@ -247,8 +286,8 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
 
     cross_matrix_data = {} # Key: (tag_i, tag_j) -> {sum1, sum5, count}
 
-    for i in range(len(performance_records)):
-        p_rec = performance_records[i]
+    for i in range(len(performance_records_all)):
+        p_rec = performance_records_all[i]
         tags = sample_tags[i]
 
         tags_list = list(tags)
@@ -277,21 +316,51 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
                 row1.append(avg1)
                 row5.append(avg5)
             else:
-                row1.append(np.nan) # Use np.nan instead of None
+                row1.append(np.nan)
                 row5.append(np.nan)
         matrix_top1.append(row1)
         matrix_top5.append(row5)
 
+    # Generate and Save Heatmap Images
+    def save_heatmap(matrix, tags, title, filename):
+        # Handle NaNs for plotting
+        matrix_arr = np.array(matrix, dtype=float)
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sns.heatmap(
+            matrix_arr,
+            annot=True,
+            fmt=".1%",
+            xticklabels=tags,
+            yticklabels=tags,
+            cmap="Blues",
+            ax=ax,
+            vmin=0, vmax=1
+        )
+        plt.title(title)
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
+
+        path = os.path.join(HISTORY_DIR, filename)
+        plt.savefig(path)
+        plt.close(fig)
+        return path
+
+    path_top1 = save_heatmap(matrix_top1, sorted_tags, "Top-1 Accuracy Breakdown", f"run_{timestamp}_matrix_top1.png")
+    path_top5 = save_heatmap(matrix_top5, sorted_tags, "Top-5 Accuracy Breakdown", f"run_{timestamp}_matrix_top5.png")
+
     cross_results = {
         "tags": sorted_tags,
         "matrix_top1": matrix_top1,
-        "matrix_top5": matrix_top5
+        "matrix_top5": matrix_top5,
+        "heatmap_top1_path": path_top1,
+        "heatmap_top5_path": path_top5
     }
 
     results = {
         "metrics": metrics,
         "cross_results": cross_results,
-        "n_samples": len(filtered_items) if mode == "i2t" else len(unique_texts),
+        "n_samples": len(filtered_items) if mode == "i2t" else len(filtered_unique_text_indices),
         "timestamp": timestamp,
         "model": model_name,
         "filters": selected_filters,
@@ -395,51 +464,63 @@ with tab1:
             m5 = cross.get("matrix_top5", [])
 
             if tags:
-                # Ensure data is numeric (handle None from JSON reload or previous state)
-                # If we loaded from JSON, Nones are present.
-                # If we just ran, NaNs are present.
-                # Seaborn needs floats. None/NaN are fine for missing data if dtype is float.
-
-                def to_float_array(arr):
-                    # Convert None to NaN and ensure float dtype
-                    narr = np.array(arr, dtype=object) # Start as object to handle None
-                    narr[narr == None] = np.nan
-                    return narr.astype(float)
-
-                m1_arr = to_float_array(m1)
-                m5_arr = to_float_array(m5)
-
                 mtab1, mtab2 = st.tabs(["Top-1 Accuracy", "Top-5 Accuracy"])
 
+                # Check for saved images
+                img1 = cross.get("heatmap_top1_path")
+                img5 = cross.get("heatmap_top5_path")
+
                 with mtab1:
-                    fig, ax = plt.subplots(figsize=(10, 8))
-                    sns.heatmap(
-                        m1_arr,
-                        annot=True,
-                        fmt=".1%",
-                        xticklabels=tags,
-                        yticklabels=tags,
-                        cmap="Blues",
-                        ax=ax,
-                        vmin=0, vmax=1
-                    )
-                    plt.xticks(rotation=45, ha="right")
-                    st.pyplot(fig)
+                    if img1 and os.path.exists(img1):
+                        st.image(img1, caption="Top-1 Matrix Breakdown")
+                    else:
+                        st.info("No heatmap image found. (Fallback to dynamic rendering)")
+                        # Fallback
+                        def to_float_array(arr):
+                            narr = np.array(arr, dtype=object)
+                            narr[narr == None] = np.nan
+                            return narr.astype(float)
+
+                        m1_arr = to_float_array(m1)
+                        fig, ax = plt.subplots(figsize=(10, 8))
+                        sns.heatmap(
+                            m1_arr,
+                            annot=True,
+                            fmt=".1%",
+                            xticklabels=tags,
+                            yticklabels=tags,
+                            cmap="Blues",
+                            ax=ax,
+                            vmin=0, vmax=1
+                        )
+                        plt.xticks(rotation=45, ha="right")
+                        st.pyplot(fig)
 
                 with mtab2:
-                    fig, ax = plt.subplots(figsize=(10, 8))
-                    sns.heatmap(
-                        m5_arr,
-                        annot=True,
-                        fmt=".1%",
-                        xticklabels=tags,
-                        yticklabels=tags,
-                        cmap="Blues",
-                        ax=ax,
-                        vmin=0, vmax=1
-                    )
-                    plt.xticks(rotation=45, ha="right")
-                    st.pyplot(fig)
+                    if img5 and os.path.exists(img5):
+                        st.image(img5, caption="Top-5 Matrix Breakdown")
+                    else:
+                        st.info("No heatmap image found. (Fallback to dynamic rendering)")
+                        # Fallback
+                        def to_float_array(arr):
+                            narr = np.array(arr, dtype=object)
+                            narr[narr == None] = np.nan
+                            return narr.astype(float)
+
+                        m5_arr = to_float_array(m5)
+                        fig, ax = plt.subplots(figsize=(10, 8))
+                        sns.heatmap(
+                            m5_arr,
+                            annot=True,
+                            fmt=".1%",
+                            xticklabels=tags,
+                            yticklabels=tags,
+                            cmap="Blues",
+                            ax=ax,
+                            vmin=0, vmax=1
+                        )
+                        plt.xticks(rotation=45, ha="right")
+                        st.pyplot(fig)
 
 with tab2:
     st.header("Debug View")
