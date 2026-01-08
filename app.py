@@ -649,6 +649,7 @@ with tab4:
     history_files = sorted([f for f in os.listdir(HISTORY_DIR) if f.endswith(".json")], reverse=True)
 
     selected_runs = st.multiselect("Select runs to compare", history_files)
+    baseline_run = st.selectbox("Select Baseline Run", selected_runs) if selected_runs else None
 
     if st.button("Generate Comparison Report"):
         if not selected_runs:
@@ -656,11 +657,15 @@ with tab4:
         else:
             # Aggregate data
             comparison_data = []
+            baseline_data = None
+
             for fname in selected_runs:
                 with open(os.path.join(HISTORY_DIR, fname)) as f:
                     data = json.load(f)
                     data["filename"] = fname
                     comparison_data.append(data)
+                    if fname == baseline_run:
+                        baseline_data = data
 
             # Create HTML
             html_content = "<html><head><title>Comparison Report</title>"
@@ -746,6 +751,87 @@ with tab4:
                         html_content += "<td>N/A</td>"
                 html_content += "</tr>"
             html_content += "</table>"
+
+            # --- Comparison Heatmap (Delta) ---
+            if baseline_data and len(comparison_data) > 1:
+                html_content += "<h2>Comparison Heatmaps (Delta: Comparison - Baseline)</h2>"
+
+                # Custom Colormap: Yellow (Neg) -> White (0) -> Blue (Pos)
+                from matplotlib.colors import LinearSegmentedColormap
+                colors = ["#F7D02C", "#FFFFFF", "#1E90FF"] # Yellow, White, DodgerBlue
+                cmap_delta = LinearSegmentedColormap.from_list("custom_delta", colors)
+
+                def get_matrix_map(data):
+                    """Extracts tags and Top-1 matrix from run data."""
+                    if "cross_results" in data:
+                        tags = data["cross_results"]["tags"]
+                        mat = np.array(data["cross_results"]["matrix_top1"], dtype=float)
+                        return tags, mat
+                    return None, None
+
+                base_tags, base_mat = get_matrix_map(baseline_data)
+
+                if base_tags is not None:
+                    for d in comparison_data:
+                        if d["filename"] == baseline_data["filename"]:
+                            continue
+
+                        comp_tags, comp_mat = get_matrix_map(d)
+                        if comp_tags is None: continue
+
+                        # Union of tags
+                        all_comparison_tags = sorted(list(set(base_tags) | set(comp_tags)))
+
+                        # Reconstruct aligned matrices
+                        def align_matrix(tags, mat, all_tags):
+                            size = len(all_tags)
+                            aligned = np.full((size, size), np.nan)
+
+                            # Create mapping from old idx to new idx
+                            old_to_new = {}
+                            for i, t in enumerate(tags):
+                                if t in all_tags:
+                                    old_to_new[i] = all_tags.index(t)
+
+                            for r in range(mat.shape[0]):
+                                for c in range(mat.shape[1]):
+                                    if r in old_to_new and c in old_to_new:
+                                        aligned[old_to_new[r], old_to_new[c]] = mat[r, c]
+                            return aligned
+
+                        m_base_aligned = align_matrix(base_tags, base_mat, all_comparison_tags)
+                        m_comp_aligned = align_matrix(comp_tags, comp_mat, all_comparison_tags)
+
+                        # Compute Delta
+                        delta_mat = m_comp_aligned - m_base_aligned
+
+                        # Plot
+                        fig, ax = plt.subplots(figsize=(10, len(all_comparison_tags)*0.5 + 2))
+                        sns.heatmap(
+                            delta_mat,
+                            annot=True,
+                            fmt=".1%",
+                            xticklabels=all_comparison_tags,
+                            yticklabels=all_comparison_tags,
+                            cmap=cmap_delta,
+                            center=0,
+                            vmin=-0.5, vmax=0.5, # Fixed range for consistency or auto? let's constrain a bit
+                            ax=ax
+                        )
+                        plt.title(f"Delta: {d['filename']} - Baseline ({baseline_data['filename']})")
+                        plt.xticks(rotation=45, ha="right")
+
+                        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        safe_name = d['filename'].replace(".json", "")
+                        delta_path = os.path.join(HISTORY_DIR, f"delta_{safe_name}_vs_base_{ts_str}.png")
+                        plt.savefig(delta_path, bbox_inches="tight")
+                        plt.close(fig)
+
+                        st.write(f"### Comparison: {d['filename']} vs Baseline")
+                        st.image(delta_path)
+
+                        html_content += f"<h3>{d['filename']} vs Baseline</h3>"
+                        html_content += f"<img src='{os.path.basename(delta_path)}' style='max-width:100%;'><br>"
 
             html_content += "</body></html>"
 

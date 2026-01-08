@@ -24,10 +24,13 @@ This project is a CLIP Evaluation Tool designed to assess the performance of CLI
 -   **Storage:** Attributes are stored keyed by the image's MD5 hash to avoid re-processing duplicates.
 
 ### 3. History & Comparison (`app.py` - Tab 3)
--   **Comparison:** Allows users to select multiple past runs from the `history/` folder.
+-   **Comparison:** Allows users to select multiple past runs from the `history/` folder and choose a **Baseline Run**.
 -   **Reporting:** Generates a unified HTML report containing:
     -   A summary table of runs (Model, Samples, Top-1 Acc, Active Filters).
     -   Detailed **Matrix Breakdown** tables comparing accuracy across attributes for each run.
+    -   **Comparison Heatmaps (Delta):** Visualizes the accuracy difference (Run - Baseline) for "All Tags" interactions.
+        -   **Yellow:** Negative difference (Regression).
+        -   **Blue:** Positive difference (Improvement).
     -   Downloadable HTML report.
 -   **Visualization:** Displays a simple bar chart of Global Top-1 accuracy for selected runs.
 
