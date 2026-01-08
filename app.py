@@ -138,7 +138,7 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     unique_texts = get_unique_texts(filtered_items)
 
     # Load Model
-    model = CLIPModel(model_name, pretrained_tag if pretrained_tag else None, None, device, "eval_cache.pt")
+    model = CLIPModel(model_name, None, pretrained_tag, device, "eval_cache.pt")
     model.load()
 
     # Encode
@@ -227,9 +227,10 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         for item in filtered_items:
             tags = set()
             for k, v in item.attributes.items():
-                tag = f"{k}: {v}"
-                tags.add(tag)
-                all_tags.add(tag)
+                if k != 'filename':
+                    tag = f"{k}: {v}"
+                    tags.add(tag)
+                    all_tags.add(tag)
             sample_tags.append(tags)
     else:
         for idx, text in enumerate(unique_texts):
@@ -238,9 +239,10 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
             for oid in origin_indices:
                 item = filtered_items[oid]
                 for k, v in item.attributes.items():
-                    tag = f"{k}: {v}"
-                    tags.add(tag)
-                    all_tags.add(tag)
+                    if k != 'filename':
+                        tag = f"{k}: {v}"
+                        tags.add(tag)
+                        all_tags.add(tag)
             sample_tags.append(tags)
 
     sorted_tags = sorted(list(all_tags))
@@ -266,6 +268,14 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     matrix_top5 = []
     matrix_counts = [] # Added for mixing heatmap
 
+    # This loop generates the FULL matrix (all vs all)
+    # We will still compute it for completeness in 'cross_results' if needed,
+    # or we can just compute the sub-matrices for display.
+    # The existing code computes the full NxN.
+    # We can keep it to support the "old" view if needed, or just for data structure consistency.
+    
+    print(sorted_tags)
+    
     for t1 in sorted_tags:
         row1 = []
         row5 = []
@@ -280,9 +290,9 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
                 row5.append(avg5)
                 row_c.append(d["count"])
             else:
-                row1.append(np.nan) # Use np.nan instead of None
+                row1.append(np.nan) 
                 row5.append(np.nan)
-                row_c.append(0) # Count is 0 if no intersection
+                row_c.append(0)
         matrix_top1.append(row1)
         matrix_top5.append(row5)
         matrix_counts.append(row_c)
@@ -306,9 +316,20 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         "tags": sorted_tags,
         "matrix_top1": matrix_top1,
         "matrix_top5": matrix_top5,
-        "matrix_counts": matrix_counts, # Added
-        "tag_stats": tag_stats # Added
+        "matrix_counts": matrix_counts, 
+        "tag_stats": tag_stats 
     }
+
+    # Identify Tag Groups
+    # Extract keys from "Key: Value" tags
+    tag_groups = {}
+    for t in sorted_tags:
+        if ": " in t:
+            k, v = t.split(": ", 1)
+            if k not in tag_groups: tag_groups[k] = []
+            tag_groups[k].append(t)
+    
+    cross_results["tag_groups"] = tag_groups
 
     results = {
         "metrics": metrics,
@@ -422,71 +443,106 @@ with tab1:
 
             # --- Tag Mixing Matrix ---
             st.subheader("Tag Mixing Matrix (Accuracy)")
-
+            
             tags = cross.get("tags", [])
+            tag_groups = cross.get("tag_groups", {})
+            print(f"Tag Groups Found: {tag_groups.keys()}")
             m1 = cross.get("matrix_top1", [])
             m5 = cross.get("matrix_top5", [])
+            ts_str = res.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
 
             if tags and m1:
                 def to_float_array(arr):
-                    # Convert None to NaN and ensure float dtype
-                    narr = np.array(arr, dtype=object)
+                    narr = np.array(arr, dtype=object) 
                     narr[narr == None] = np.nan
                     return narr.astype(float)
 
                 m1_arr = to_float_array(m1)
                 m5_arr = to_float_array(m5)
 
-                mtab1, mtab2 = st.tabs(["Top-1 Accuracy", "Top-5 Accuracy"])
+                # Iterate over groups to create sub-matrices
+                # If no groups found (no ": " in tags), fallback to full matrix?
+                # The prompt implies structured tags. If simple tags, maybe just one group.
+                
+                groups_to_plot = list(tag_groups.keys()) if tag_groups else ["All"]
+                
+                for grp in groups_to_plot:
+                    print(f"Processing group: {grp}")
+                    st.markdown(f"#### Group: {grp}")
+                    
+                    if grp == "All":
+                         row_indices = range(len(tags))
+                         col_indices = range(len(tags))
+                         sub_tags_row = tags
+                         sub_tags_col = tags
+                    else:
+                        # Row indices: tags in this group
+                        row_indices = [i for i, t in enumerate(tags) if t in tag_groups[grp]]
+                        # Col indices: tags NOT in this group
+                        col_indices = [i for i, t in enumerate(tags) if t not in tag_groups[grp]]
+                        
+                        sub_tags_row = [tags[i] for i in row_indices]
+                        sub_tags_col = [tags[i] for i in col_indices]
+                    
+                    if not row_indices or not col_indices:
+                        st.write("No interactions with outside groups.")
+                        continue
 
-                ts_str = res.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
+                    # Extract sub-arrays
+                    # m1_arr[row_indices, :][:, col_indices]
+                    # numpy advanced indexing
+                    sub_m1 = m1_arr[np.ix_(row_indices, col_indices)]
+                    sub_m5 = m5_arr[np.ix_(row_indices, col_indices)]
+                    
+                    # Create Tabs for this group
+                    mtab1, mtab2 = st.tabs([f"{grp} Top-1", f"{grp} Top-5"])
+                    
+                    # Generate and Save Top-1
+                    fig1, ax1 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
+                    sns.heatmap(
+                        sub_m1,
+                        annot=True,
+                        fmt=".1%",
+                        xticklabels=sub_tags_col,
+                        yticklabels=sub_tags_row,
+                        cmap="Blues",
+                        ax=ax1,
+                        vmin=0, vmax=1
+                    )
+                    plt.xticks(rotation=45, ha="right")
+                    plt.title(f"{grp} Interaction Top-1")
+                    
+                    safe_grp = grp.replace(" ", "_").replace("/", "_")
+                    path_top1 = os.path.join(HISTORY_DIR, f"heatmap_{safe_grp}_top1_{ts_str}.png")
+                    plt.savefig(path_top1, bbox_inches="tight")
+                    
+                    # Generate and Save Top-5
+                    fig2, ax2 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
+                    sns.heatmap(
+                        sub_m5,
+                        annot=True,
+                        fmt=".1%",
+                        xticklabels=sub_tags_col,
+                        yticklabels=sub_tags_row,
+                        cmap="Blues",
+                        ax=ax2,
+                        vmin=0, vmax=1
+                    )
+                    plt.xticks(rotation=45, ha="right")
+                    plt.title(f"{grp} Interaction Top-5")
+                    
+                    path_top5 = os.path.join(HISTORY_DIR, f"heatmap_{safe_grp}_top5_{ts_str}.png")
+                    plt.savefig(path_top5, bbox_inches="tight")
+                    
+                    with mtab1:
+                        st.image(path_top1)
+                    with mtab2:
+                        st.image(path_top5)
 
-                # Generate and save Top-1
-                fig1, ax1 = plt.subplots(figsize=(10, 8))
-                sns.heatmap(
-                    m1_arr,
-                    annot=True,
-                    fmt=".1%",
-                    xticklabels=tags,
-                    yticklabels=tags,
-                    cmap="Blues",
-                    ax=ax1,
-                    vmin=0, vmax=1
-                )
-                plt.xticks(rotation=45, ha="right")
-                path_top1 = os.path.join(HISTORY_DIR, f"heatmap_top1_{ts_str}.png")
-                plt.savefig(path_top1)
+                    plt.close(fig1)
+                    plt.close(fig2)
+                    print(f"Finished group: {grp}")
 
-                # Generate and save Top-5
-                fig2, ax2 = plt.subplots(figsize=(10, 8))
-                sns.heatmap(
-                    m5_arr,
-                    annot=True,
-                    fmt=".1%",
-                    xticklabels=tags,
-                    yticklabels=tags,
-                    cmap="Blues",
-                    ax=ax2,
-                    vmin=0, vmax=1
-                )
-                plt.xticks(rotation=45, ha="right")
-                path_top5 = os.path.join(HISTORY_DIR, f"heatmap_top5_{ts_str}.png")
-                plt.savefig(path_top5)
-
-                with mtab1:
-                    st.pyplot(fig1)
-
-                with mtab2:
-                    st.pyplot(fig2)
-
-                # Close figures after rendering
-                # Note: st.pyplot usually handles the figure, but closing is good practice
-                # to free memory, especially since we saved it.
-                # However, st.pyplot reads from the object.
-                # We can rely on matplotlib garbage collection or explicit close.
-                # But if we close it before st.pyplot, st.pyplot might fail?
-                # st.pyplot takes the figure object.
-                # Let's keep them open until script end (Streamlit clears them).
 
 with tab2:
     st.header("Debug View")
