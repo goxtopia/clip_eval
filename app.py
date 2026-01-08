@@ -136,15 +136,15 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     if not filtered_items:
         return None, "No items match the selected filters."
 
-    # Prepare logic using ALL items for matrix, but subset for metrics
-    unique_texts = get_unique_texts(items) # Use ALL items for unique texts
+    # Prepare logic using FILTERED items only
+    unique_texts = get_unique_texts(filtered_items)
 
     # Load Model
     model = CLIPModel(model_name, pretrained_tag if pretrained_tag else None, None, device, "eval_cache.pt")
     model.load()
 
-    # Encode ALL items
-    image_paths = [item.image_path for item in items]
+    # Encode FILTERED items
+    image_paths = [item.image_path for item in filtered_items]
     image_features = model.encode_images(image_paths, 32)
 
     templates = ["{}"]
@@ -153,65 +153,56 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     image_features = image_features.to(device)
     text_features = text_features.to(device)
 
-    # All GT sets
-    gt_class_sets = [item.gt_class_set for item in items]
+    # Filtered GT sets
+    gt_class_sets = [item.gt_class_set for item in filtered_items]
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Store per-item hit status for ALL items for matrix breakdown
-    # format: list of tuples (is_top1, is_top5)
-    performance_records_all = []
 
     metrics = {}
     bad_cases = {}
 
-    # Pre-compute text to item indices for T2I matrix
-    text_to_item_indices_all = {}
-    for idx, item in enumerate(items):
+    # Per-sample performance records for the matrix (corresponds to filtered_items or unique_texts)
+    performance_records = []
+
+    text_to_item_indices = {}
+    for idx, item in enumerate(filtered_items):
         t = item.representative_text
         if t:
-            if t not in text_to_item_indices_all: text_to_item_indices_all[t] = []
-            text_to_item_indices_all[t].append(idx)
+            if t not in text_to_item_indices: text_to_item_indices[t] = []
+            text_to_item_indices[t].append(idx)
 
     if mode == "i2t":
-        # Calculate for ALL
         sims_i2t = image_features @ text_features.T
         k = min(5, sims_i2t.size(1))
         _, top_idx = sims_i2t.topk(k=k, dim=-1)
         pred_classes = top_idx.cpu()
 
-        # 1. Global Metrics (Filtered Subset)
-        # Extract predictions for filtered indices
-        filtered_pred_classes = pred_classes[filtered_indices]
-        filtered_gt_sets = [gt_class_sets[i] for i in filtered_indices]
-
-        # We need class_to_images for the filtered subset for per-class metrics
-        class_to_images_filtered = {}
+        class_to_images = {}
         for idx, item in enumerate(filtered_items):
             if not item.representative_text: continue
             rep_lbl = normalize_label(item.representative_text)
-            if rep_lbl not in class_to_images_filtered: class_to_images_filtered[rep_lbl] = []
-            class_to_images_filtered[rep_lbl].append(idx)
+            if rep_lbl not in class_to_images: class_to_images[rep_lbl] = []
+            class_to_images[rep_lbl].append(idx)
 
         metrics, per_class, bad_cases = compute_metrics(
-            filtered_pred_classes, filtered_gt_sets, unique_texts, class_to_images_filtered
+            pred_classes, gt_class_sets, unique_texts, class_to_images
         )
 
-        # 2. Matrix Breakdown (All Items)
+        # Per-item hits for matrix
         candidate_norms = [normalize_label(t) for t in unique_texts]
 
-        for i in range(len(items)):
+        for i in range(len(filtered_items)):
             gset = gt_class_sets[i]
             preds_idx = pred_classes[i].tolist()
             pred_norms = [candidate_norms[p] for p in preds_idx]
 
             if not gset:
-                performance_records_all.append((0.0, 0.0))
+                performance_records.append((0.0, 0.0))
                 continue
 
             hit1 = 1.0 if pred_norms[0] in gset else 0.0
             hit5 = 1.0 if any(p in gset for p in pred_norms) else 0.0
-            performance_records_all.append((hit1, hit5))
+            performance_records.append((hit1, hit5))
 
     else: # T2I
         sims_t2i = text_features @ image_features.T
@@ -219,50 +210,26 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         _, top_idx = sims_t2i.topk(k=k, dim=-1)
         pred_images = top_idx.cpu()
 
-        # 1. Global Metrics (Filtered Subset)
-        # Map text to filtered items
-        filtered_unique_text_indices = []
-
-        for i, text in enumerate(unique_texts):
-            # Original indices of this text
-            original_indices = text_to_item_indices_all.get(text, [])
-            # Check overlap with filtered_indices
-            overlap = [oid for oid in original_indices if oid in filtered_indices]
-            if overlap:
-                filtered_unique_text_indices.append(i)
-
-        if not filtered_unique_text_indices:
-             return None, "No queries match the selected filters."
-
-        # Extract subset of pred_images (queries)
-        filtered_pred_images = pred_images[filtered_unique_text_indices]
-        filtered_queries = [unique_texts[i] for i in filtered_unique_text_indices]
-
         metrics, per_class, bad_cases = compute_t2i_metrics(
-            filtered_pred_images, gt_class_sets, filtered_queries
+            pred_images, gt_class_sets, unique_texts
         )
 
-        # 2. Matrix Breakdown (All Items)
-        # First compute metrics for all to get per-query hits
-        _, per_class_all, _ = compute_t2i_metrics(
-             pred_images, gt_class_sets, unique_texts
-        )
-        # per_class_all is list of stats, same order as unique_texts
-        for stats in per_class_all:
-            performance_records_all.append((stats["top1"], stats["top5"]))
+        # per_class is aligned with unique_texts
+        for stats in per_class:
+            performance_records.append((stats["top1"], stats["top5"]))
 
     # Save Debug if enabled
     debug_dir = None
     if debug_mode and bad_cases:
         debug_dir = save_debug_cases(filtered_items, bad_cases, mode, timestamp)
 
-    # --- Cross-Attribute Matrix Calculation (On ALL data) ---
+    # --- Cross-Attribute Matrix Calculation (On FILTERED data) ---
     sample_tags = []
     all_tags = set()
 
     if mode == "i2t":
-        # performance_records_all matches 'items' (all)
-        for item in items:
+        # performance_records matches 'filtered_items'
+        for item in filtered_items:
             tags = set()
             for k, v in item.attributes.items():
                 tag = f"{k}: {v}"
@@ -270,12 +237,12 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
                 all_tags.add(tag)
             sample_tags.append(tags)
     else:
-        # performance_records_all matches 'unique_texts' (all)
+        # performance_records matches 'unique_texts' (of filtered set)
         for idx, text in enumerate(unique_texts):
-            origin_indices = text_to_item_indices_all.get(text, [])
+            origin_indices = text_to_item_indices.get(text, [])
             tags = set()
             for oid in origin_indices:
-                item = items[oid]
+                item = filtered_items[oid]
                 for k, v in item.attributes.items():
                     tag = f"{k}: {v}"
                     tags.add(tag)
@@ -286,8 +253,8 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
 
     cross_matrix_data = {} # Key: (tag_i, tag_j) -> {sum1, sum5, count}
 
-    for i in range(len(performance_records_all)):
-        p_rec = performance_records_all[i]
+    for i in range(len(performance_records)):
+        p_rec = performance_records[i]
         tags = sample_tags[i]
 
         tags_list = list(tags)
@@ -303,6 +270,7 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
 
     matrix_top1 = []
     matrix_top5 = []
+    marginal_stats = []
 
     for t1 in sorted_tags:
         row1 = []
@@ -315,6 +283,15 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
                 avg5 = d["sum5"] / d["count"]
                 row1.append(avg1)
                 row5.append(avg5)
+
+                # Extract Diagonal (Marginal Stats) for Table
+                if t1 == t2:
+                    marginal_stats.append({
+                        "Tag": t1,
+                        "Count": d["count"],
+                        "Top-1 (%)": avg1 * 100,
+                        "Top-5 (%)": avg5 * 100
+                    })
             else:
                 row1.append(np.nan)
                 row5.append(np.nan)
@@ -354,13 +331,14 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         "matrix_top1": matrix_top1,
         "matrix_top5": matrix_top5,
         "heatmap_top1_path": path_top1,
-        "heatmap_top5_path": path_top5
+        "heatmap_top5_path": path_top5,
+        "marginal_stats": marginal_stats
     }
 
     results = {
         "metrics": metrics,
         "cross_results": cross_results,
-        "n_samples": len(filtered_items) if mode == "i2t" else len(filtered_unique_text_indices),
+        "n_samples": len(filtered_items) if mode == "i2t" else len(unique_texts),
         "timestamp": timestamp,
         "model": model_name,
         "filters": selected_filters,
@@ -462,6 +440,29 @@ with tab1:
             tags = cross.get("tags", [])
             m1 = cross.get("matrix_top1", [])
             m5 = cross.get("matrix_top5", [])
+            marginal_stats = cross.get("marginal_stats", [])
+
+            if marginal_stats:
+                st.write("#### Attribute Performance Table")
+                # Process marginal stats for cleaner display
+                processed_stats = []
+                for item in marginal_stats:
+                    tag = item["Tag"]
+                    if ": " in tag:
+                        attr, val = tag.split(": ", 1)
+                    else:
+                        attr, val = "Tag", tag
+
+                    processed_stats.append({
+                        "Attribute": attr,
+                        "Value": val,
+                        "Count": item["Count"],
+                        "Top-1 (%)": f"{item['Top-1 (%)']:.2f}",
+                        "Top-5 (%)": f"{item['Top-5 (%)']:.2f}"
+                    })
+
+                df_stats = pd.DataFrame(processed_stats)
+                st.dataframe(df_stats, use_container_width=True)
 
             if tags:
                 mtab1, mtab2 = st.tabs(["Top-1 Accuracy", "Top-5 Accuracy"])
