@@ -1,0 +1,15 @@
+streamlit
+torch
+torchvision
+open_clip_torch
+ultralytics
+openai
+opencv-python
+pandas
+seaborn
+matplotlib
+ftfy
+regex
+tqdm
+requests
+transformers

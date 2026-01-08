@@ -8,6 +8,20 @@ __pycache__
 venv/
 env/
 
+# Data
+data/
+# Keep example data if intended, but usually data is local.
+# If there is specific example data, we should unignore it or track it separately.
+# For now, ignoring generic 'data' folder as per common practice.
+
+# History and artifacts
+history/
+eval_cache.pt
+eval_image_features.pt
+yolo11x.pt
+debug/
+comparison_report.html
+
 # Chroma database
 chroma_db/
 
@@ -29,4 +43,3 @@ build/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
-
