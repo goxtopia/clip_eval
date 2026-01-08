@@ -441,37 +441,52 @@ with tab1:
 
                 ts_str = res.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
 
+                # Generate and save Top-1
+                fig1, ax1 = plt.subplots(figsize=(10, 8))
+                sns.heatmap(
+                    m1_arr,
+                    annot=True,
+                    fmt=".1%",
+                    xticklabels=tags,
+                    yticklabels=tags,
+                    cmap="Blues",
+                    ax=ax1,
+                    vmin=0, vmax=1
+                )
+                plt.xticks(rotation=45, ha="right")
+                path_top1 = os.path.join(HISTORY_DIR, f"heatmap_top1_{ts_str}.png")
+                plt.savefig(path_top1)
+
+                # Generate and save Top-5
+                fig2, ax2 = plt.subplots(figsize=(10, 8))
+                sns.heatmap(
+                    m5_arr,
+                    annot=True,
+                    fmt=".1%",
+                    xticklabels=tags,
+                    yticklabels=tags,
+                    cmap="Blues",
+                    ax=ax2,
+                    vmin=0, vmax=1
+                )
+                plt.xticks(rotation=45, ha="right")
+                path_top5 = os.path.join(HISTORY_DIR, f"heatmap_top5_{ts_str}.png")
+                plt.savefig(path_top5)
+
                 with mtab1:
-                    fig, ax = plt.subplots(figsize=(10, 8))
-                    sns.heatmap(
-                        m1_arr,
-                        annot=True,
-                        fmt=".1%",
-                        xticklabels=tags,
-                        yticklabels=tags,
-                        cmap="Blues",
-                        ax=ax,
-                        vmin=0, vmax=1
-                    )
-                    plt.xticks(rotation=45, ha="right")
-                    plt.savefig(os.path.join(HISTORY_DIR, f"heatmap_top1_{ts_str}.png"))
-                    st.pyplot(fig)
+                    st.pyplot(fig1)
 
                 with mtab2:
-                    fig, ax = plt.subplots(figsize=(10, 8))
-                    sns.heatmap(
-                        m5_arr,
-                        annot=True,
-                        fmt=".1%",
-                        xticklabels=tags,
-                        yticklabels=tags,
-                        cmap="Blues",
-                        ax=ax,
-                        vmin=0, vmax=1
-                    )
-                    plt.xticks(rotation=45, ha="right")
-                    plt.savefig(os.path.join(HISTORY_DIR, f"heatmap_top5_{ts_str}.png"))
-                    st.pyplot(fig)
+                    st.pyplot(fig2)
+
+                # Close figures after rendering
+                # Note: st.pyplot usually handles the figure, but closing is good practice
+                # to free memory, especially since we saved it.
+                # However, st.pyplot reads from the object.
+                # We can rely on matplotlib garbage collection or explicit close.
+                # But if we close it before st.pyplot, st.pyplot might fail?
+                # st.pyplot takes the figure object.
+                # Let's keep them open until script end (Streamlit clears them).
 
 with tab2:
     st.header("Debug View")
