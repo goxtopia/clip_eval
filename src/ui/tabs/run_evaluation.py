@@ -115,64 +115,115 @@ def render_results(res, show_support):
 
     # --- Joint Tag Analysis ---
     st.divider()
-    with st.expander("Joint Tag Analysis (Intersection)"):
-        # Collect all available tags from this run
-        all_avail_tags = set()
+    with st.expander("Joint Tag Analysis (Intersection)", expanded=True):
+        from src.analysis_config import load_queries, save_queries
+
+        # Load existing
+        if "saved_queries" not in st.session_state:
+            st.session_state["saved_queries"] = load_queries()
         
-        # Check cross results for tags
+        saved_queries = st.session_state["saved_queries"]
+
+        # Collect all available tags
+        all_avail_tags = set()
         for cat in ["img", "txt"]:
             if cat in cross:
                 all_avail_tags.update(cross[cat].get("tags", []))
-        
         sorted_avail = sorted(list(all_avail_tags))
-        sel_joint_tags = st.multiselect("Select Tags to Combine (Intersection)", sorted_avail, key="joint_res")
-        
-        if st.button("Calculate Joint Accuracy", key="btn_joint_res"):
-            if not sel_joint_tags:
-                st.warning("Select at least one tag.")
-            else:
-                # Process per_sample_results
+
+        # Add New Query UI
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
+            new_tags = st.multiselect("Select Tags", sorted_avail, key="new_query_tags")
+        with c2:
+            default_name = f"Query {len(saved_queries)+1}"
+            new_name = st.text_input("Query Name", value=default_name, key="new_query_name")
+        with c3:
+            st.write("") # Spacer
+            st.write("") 
+            if st.button("Add Query"):
+                if not new_tags:
+                    st.warning("Select tags first.")
+                else:
+                    # Check duplicate name
+                    if any(q['name'] == new_name for q in saved_queries):
+                        st.warning("Query name already exists.")
+                    else:
+                        saved_queries.append({"name": new_name, "tags": new_tags})
+                        save_queries(saved_queries)
+                        st.session_state["saved_queries"] = saved_queries
+                        st.success(f"Added '{new_name}'")
+                        st.rerun()
+
+        # Calculation & Display
+        if saved_queries:
+            st.subheader("Analysis Results")
+            
+            results_data = []
+            
+            # Allow deleting
+            queries_to_remove = []
+
+            for i, q in enumerate(saved_queries):
+                q_name = q["name"]
+                q_tags = q["tags"]
+                
+                # Check coverage (tags present in current run?)
+                missing_tags = [t for t in q_tags if t not in all_avail_tags]
+                
+                # Calculate
                 per_sample = res.get("per_sample_results", [])
+                
                 matches = []
                 for s in per_sample:
                     attrs = s.get("attributes", {})
-                    # Check if ALL selected tags are present
-                    # Attributes dict has {key: val} or {key: [vals]}
-                    # Tag format is "Key: Value"
-                    
                     match_all = True
-                    for t in sel_joint_tags:
+                    for t in q_tags:
                         if ": " not in t: 
-                            match_all = False
-                            break
+                            match_all = False; break
                         tk, tv = t.split(": ", 1)
-                        
                         if tk not in attrs:
-                            match_all = False
-                            break
-                        
+                            match_all = False; break
                         av = attrs[tk]
                         if isinstance(av, list):
-                            if tv not in av:
-                                match_all = False
-                                break
+                            if tv not in av: match_all = False; break
                         else:
-                            if str(av) != tv:
-                                match_all = False
-                                break
+                            if str(av) != tv: match_all = False; break
                     
-                    if match_all:
-                        matches.append(s)
-                
-                if not matches:
-                    st.warning("No samples match ALL selected tags.")
-                else:
+                    if match_all: matches.append(s)
+
+                if matches:
                     cnt = len(matches)
                     acc1 = sum([m["hit1"] for m in matches]) / cnt
                     acc5 = sum([m["hit5"] for m in matches]) / cnt
-                    st.metric("Joint Count", cnt)
-                    st.metric("Joint Top-1", f"{acc1:.2%}")
-                    st.metric("Joint Top-5", f"{acc5:.2%}")
+                else:
+                    cnt = 0
+                    acc1 = 0.0
+                    acc5 = 0.0
+
+                results_data.append({
+                     "Name": q_name,
+                     "Tags": ", ".join(q_tags),
+                     "Count": cnt,
+                     "Top-1": f"{acc1:.2%}",
+                     "Top-5": f"{acc5:.2%}",
+                     "Missing Tags": ", ".join(missing_tags) if missing_tags else ""
+                })
+
+            df_res = pd.DataFrame(results_data)
+            st.dataframe(df_res) # editable=False by default
+
+            # Remove Interface
+            rem_list = st.multiselect("Select Queries to Remove", [q["name"] for q in saved_queries])
+            if rem_list:
+                if st.button("Confirm Removal"):
+                    saved_queries = [q for q in saved_queries if q["name"] not in rem_list]
+                    save_queries(saved_queries)
+                    st.session_state["saved_queries"] = saved_queries
+                    st.success("Removed selected queries.")
+                    st.rerun()
+        else:
+            st.info("No saved queries. Add one above.")
 
 def plot_matrices(cat_key, title_prefix, cross, show_support, ts_str):
     cat_data = cross.get(cat_key, {})

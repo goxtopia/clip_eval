@@ -195,83 +195,65 @@ def render_history_compare_tab():
                         html_content += f"<h3>{d['filename']} vs Baseline</h3>"
                         html_content += f"<img src='{os.path.basename(delta_path)}' style='max-width:100%;'><br>"
 
-            # --- Interactive Joint Analysis (History) ---
+            # --- Saved Queries Analysis (History) ---
             st.divider()
-            st.subheader("Joint Tag Analysis (Interactive)")
-            st.write("Compare joint accuracy across selected runs by selecting intersecting tags.")
-
-            # Collect tags from all runs
-            all_hist_tags = set()
-            for d in comparison_data:
-                # Check cross_results
-                res_img = d.get("cross_results", {}).get("img", {}) # New structure
-                res_txt = d.get("cross_results", {}).get("txt", {})
-                
-                if res_img: all_hist_tags.update(res_img.get("tags", []))
-                if res_txt: all_hist_tags.update(res_txt.get("tags", []))
-                
-                # Check old structure fallback
-                old_tags = d.get("cross_results", {}).get("tags", [])
-                if old_tags: all_hist_tags.update(old_tags)
+            st.subheader("Saved Queries Analysis")
             
-            sel_hist_tags = st.multiselect("Select Tags to Combine", sorted(list(all_hist_tags)), key="hist_joint")
+            from src.analysis_config import load_queries
+            saved_queries = load_queries()
 
-            if st.button("Calculate Joint Accuracy (History)", key="btn_hist_joint"):
-                if not sel_hist_tags:
-                    st.warning("Select at least one tag.")
-                else:
-                    joint_results = []
+            if not saved_queries:
+                st.info("No saved queries found. Create them in 'Run Evaluation' tab.")
+            else:
+                st.write("Comparing saved queries across selected runs. (Metric: Top-1 Drop-down to count/Top-5)")
+
+                # We want a table: Rows = Queries, Columns = Runs
+                # Or Rows = Runs, Columns = Queries? Rows=Queries seems better for "Feature X performance across models"
+                
+                table_data = []
+
+                for q in saved_queries:
+                    q_name = q["name"]
+                    q_tags = q["tags"]
+                    
+                    row = {"Query": q_name, "Tags": ", ".join(q_tags)}
+
                     for d in comparison_data:
                         run_name = d["filename"]
                         per_sample = d.get("per_sample_results", [])
                         
-                        if not per_sample:
-                            joint_results.append({
-                                "Run": run_name,
-                                "Count": 0,
-                                "Joint Top-1": "N/A (No Sample Data)",
-                                "Joint Top-5": "N/A"
-                            })
-                            continue
-
-                        matches = []
-                        for s in per_sample:
-                            attrs = s.get("attributes", {})
-                            match_all = True
-                            for t in sel_hist_tags:
-                                if ": " not in t: 
-                                    match_all = False; break
-                                tk, tv = t.split(": ", 1)
-                                if tk not in attrs:
-                                    match_all = False; break
-                                av = attrs[tk]
-                                if isinstance(av, list):
-                                    if tv not in av: match_all = False; break
-                                else:
-                                    if str(av) != tv: match_all = False; break
-                            
-                            if match_all: matches.append(s)
+                        cnt = 0
+                        acc1 = 0.0
                         
-                        if not matches:
-                                joint_results.append({
-                                "Run": run_name,
-                                "Count": 0,
-                                "Joint Top-1": "0.00%",
-                                "Joint Top-5": "0.00%"
-                            })
-                        else:
-                            cnt = len(matches)
-                            acc1 = sum([m["hit1"] for m in matches]) / cnt
-                            acc5 = sum([m["hit5"] for m in matches]) / cnt
+                        if per_sample:
+                            matches = []
+                            for s in per_sample:
+                                attrs = s.get("attributes", {})
+                                match_all = True
+                                for t in q_tags:
+                                    if ": " not in t: 
+                                        match_all = False; break
+                                    tk, tv = t.split(": ", 1)
+                                    if tk not in attrs:
+                                        match_all = False; break
+                                    av = attrs[tk]
+                                    if isinstance(av, list):
+                                        if tv not in av: match_all = False; break
+                                    else:
+                                        if str(av) != tv: match_all = False; break
                                 
-                            joint_results.append({
-                                "Run": run_name,
-                                "Count": cnt,
-                                "Joint Top-1": f"{acc1:.2%}",
-                                "Joint Top-5": f"{acc5:.2%}"
-                            })
-                    
-                    st.table(pd.DataFrame(joint_results))
+                                if match_all: matches.append(s)
+                            
+                            if matches:
+                                cnt = len(matches)
+                                acc1 = sum([m["hit1"] for m in matches]) / cnt
+                        
+                        # Format: "85.2% (120)"
+                        row[run_name] = f"{acc1:.1%} ({cnt})"
+
+                    table_data.append(row)
+
+                st.dataframe(pd.DataFrame(table_data))
 
             html_content += "</body></html>"
 
