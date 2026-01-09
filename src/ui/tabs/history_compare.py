@@ -1,0 +1,283 @@
+import streamlit as st
+import os
+import json
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+
+HISTORY_DIR = "history"
+
+def render_history_compare_tab():
+    st.header("History & Compare")
+
+    if not os.path.exists(HISTORY_DIR):
+        os.makedirs(HISTORY_DIR)
+
+    history_files = sorted([f for f in os.listdir(HISTORY_DIR) if f.endswith(".json")], reverse=True)
+
+    selected_runs = st.multiselect("Select runs to compare", history_files)
+    baseline_run = st.selectbox("Select Baseline Run", selected_runs) if selected_runs else None
+
+    if st.button("Generate Comparison Report"):
+        if not selected_runs:
+            st.warning("Select at least one run.")
+        else:
+            # Aggregate data
+            comparison_data = []
+            baseline_data = None
+
+            for fname in selected_runs:
+                with open(os.path.join(HISTORY_DIR, fname)) as f:
+                    data = json.load(f)
+                    data["filename"] = fname
+                    comparison_data.append(data)
+                    if fname == baseline_run:
+                        baseline_data = data
+
+            # Create HTML
+            html_content = "<html><head><title>Comparison Report</title>"
+            html_content += "<style>table {border-collapse: collapse; width: 100%;} th, td {border: 1px solid black; padding: 8px; text-align: left;} th {background-color: #f2f2f2;}</style>"
+            html_content += "</head><body><h1>Comparison Report</h1>"
+
+            # Summary Table
+            html_content += "<h2>Summary</h2><table><tr><th>Run</th><th>Mode</th><th>Model</th><th>Samples</th><th>Global Top-1</th><th>Global Top-5</th><th>Active Tags</th></tr>"
+            for d in comparison_data:
+                filters_str = ", ".join([f"{k}:{v}" for k,v in d.get("filters", {}).items() if v])
+                mode_str = d.get("mode", "i2t") # default for old runs
+
+                if "metrics" in d:
+                    g_top1 = d["metrics"]["global_top1"]
+                    g_top5 = d["metrics"]["global_top5"]
+                elif "metrics_i2t" in d:
+                    g_top1 = d["metrics_i2t"]["global_top1"]
+                    g_top5 = 0.0
+                else:
+                    g_top1 = 0.0
+                    g_top5 = 0.0
+
+                html_content += f"<tr><td>{d['filename']}</td><td>{mode_str}</td><td>{d['model']}</td><td>{d['n_samples']}</td><td>{g_top1*100:.2f}%</td><td>{g_top5*100:.2f}%</td><td>{filters_str}</td></tr>"
+            html_content += "</table>"
+
+            # Detailed Matrix Comparison
+            html_content += "<h2>Attribute Performance (Derived from Cross-Matrix)</h2>"
+
+            # Collect all unique tags across runs
+            all_tags_report = set()
+            for d in comparison_data:
+                if "cross_results" in d:
+                    all_tags_report.update(d["cross_results"].get("tags", []))
+                elif "matrix_results" in d:
+                     for attr, vals in d["matrix_results"].items():
+                         for val in vals:
+                             all_tags_report.add(f"{attr}: {val}")
+
+            html_content += "<table><tr><th>Tag</th>"
+            for d in comparison_data:
+                html_content += f"<th>{d['filename']} (Top1 / Top5)</th>"
+            html_content += "</tr>"
+
+            for tag in sorted(list(all_tags_report)):
+                html_content += f"<tr><td>{tag}</td>"
+                for d in comparison_data:
+                    # Try to find stats
+                    t1, t5, cnt = None, None, None
+
+                    if "cross_results" in d:
+                        # Find index of tag
+                        tags = d["cross_results"].get("tags", [])
+                        if tag in tags:
+                            idx = tags.index(tag)
+                            # Diagonal
+                            m1_val = d["cross_results"]["matrix_top1"][idx][idx]
+                            m5_val = d["cross_results"]["matrix_top5"][idx][idx]
+
+                            if m1_val is not None:
+                                t1 = float(m1_val)
+                                t5 = float(m5_val) if m5_val is not None else 0.0
+
+                    elif "matrix_results" in d:
+                        # Parse tag "Attr: Val"
+                        if ": " in tag:
+                            k, v = tag.split(": ", 1)
+                            stats = d["matrix_results"].get(k, {}).get(v)
+                            if stats:
+                                t1 = stats.get("top1")
+                                t5 = stats.get("top5", 0)
+                                cnt = stats.get("count")
+
+                    if t1 is not None:
+                        html_content += f"<td>{t1*100:.1f}% / {t5*100:.1f}%</td>"
+                    else:
+                        html_content += "<td>N/A</td>"
+                html_content += "</tr>"
+            html_content += "</table>"
+
+            # --- Comparison Heatmap (Delta) ---
+            if baseline_data and len(comparison_data) > 1:
+                html_content += "<h2>Comparison Heatmaps (Delta: Comparison - Baseline)</h2>"
+
+                # Custom Colormap: Yellow (Neg) -> White (0) -> Blue (Pos)
+                from matplotlib.colors import LinearSegmentedColormap
+                colors = ["#F7D02C", "#FFFFFF", "#1E90FF"] # Yellow, White, DodgerBlue
+                cmap_delta = LinearSegmentedColormap.from_list("custom_delta", colors)
+
+                def get_matrix_map(data):
+                    """Extracts tags and Top-1 matrix from run data."""
+                    if "cross_results" in data:
+                        tags = data["cross_results"]["tags"]
+                        mat = np.array(data["cross_results"]["matrix_top1"], dtype=float)
+                        return tags, mat
+                    return None, None
+
+                base_tags, base_mat = get_matrix_map(baseline_data)
+
+                if base_tags is not None:
+                    for d in comparison_data:
+                        if d["filename"] == baseline_data["filename"]:
+                            continue
+
+                        comp_tags, comp_mat = get_matrix_map(d)
+                        if comp_tags is None: continue
+
+                        # Union of tags
+                        all_comparison_tags = sorted(list(set(base_tags) | set(comp_tags)))
+
+                        # Reconstruct aligned matrices
+                        def align_matrix(tags, mat, all_tags):
+                            size = len(all_tags)
+                            aligned = np.full((size, size), np.nan)
+
+                            # Create mapping from old idx to new idx
+                            old_to_new = {}
+                            for i, t in enumerate(tags):
+                                if t in all_tags:
+                                    old_to_new[i] = all_tags.index(t)
+
+                            for r in range(mat.shape[0]):
+                                for c in range(mat.shape[1]):
+                                    if r in old_to_new and c in old_to_new:
+                                        aligned[old_to_new[r], old_to_new[c]] = mat[r, c]
+                            return aligned
+
+                        m_base_aligned = align_matrix(base_tags, base_mat, all_comparison_tags)
+                        m_comp_aligned = align_matrix(comp_tags, comp_mat, all_comparison_tags)
+
+                        # Compute Delta
+                        delta_mat = m_comp_aligned - m_base_aligned
+
+                        # Plot
+                        fig, ax = plt.subplots(figsize=(10, len(all_comparison_tags)*0.5 + 2))
+                        sns.heatmap(
+                            delta_mat,
+                            annot=True,
+                            fmt=".1%",
+                            xticklabels=all_comparison_tags,
+                            yticklabels=all_comparison_tags,
+                            cmap=cmap_delta,
+                            center=0,
+                            vmin=-0.5, vmax=0.5,
+                            ax=ax
+                        )
+                        plt.title(f"Delta: {d['filename']} - Baseline ({baseline_data['filename']})")
+                        plt.xticks(rotation=45, ha="right")
+
+                        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        safe_name = d['filename'].replace(".json", "")
+                        delta_path = os.path.join(HISTORY_DIR, f"delta_{safe_name}_vs_base_{ts_str}.png")
+                        plt.savefig(delta_path, bbox_inches="tight")
+                        plt.close(fig)
+
+                        st.write(f"### Comparison: {d['filename']} vs Baseline")
+                        st.image(delta_path)
+
+                        html_content += f"<h3>{d['filename']} vs Baseline</h3>"
+                        html_content += f"<img src='{os.path.basename(delta_path)}' style='max-width:100%;'><br>"
+
+            # --- Interactive Joint Analysis (History) ---
+            st.divider()
+            st.subheader("Joint Tag Analysis (Interactive)")
+            st.write("Compare joint accuracy across selected runs by selecting intersecting tags.")
+
+            # Collect tags from all runs
+            all_hist_tags = set()
+            for d in comparison_data:
+                # Check cross_results
+                res_img = d.get("cross_results", {}).get("img", {}) # New structure
+                res_txt = d.get("cross_results", {}).get("txt", {})
+                
+                if res_img: all_hist_tags.update(res_img.get("tags", []))
+                if res_txt: all_hist_tags.update(res_txt.get("tags", []))
+                
+                # Check old structure fallback
+                old_tags = d.get("cross_results", {}).get("tags", [])
+                if old_tags: all_hist_tags.update(old_tags)
+            
+            sel_hist_tags = st.multiselect("Select Tags to Combine", sorted(list(all_hist_tags)), key="hist_joint")
+
+            if st.button("Calculate Joint Accuracy (History)", key="btn_hist_joint"):
+                if not sel_hist_tags:
+                    st.warning("Select at least one tag.")
+                else:
+                    joint_results = []
+                    for d in comparison_data:
+                        run_name = d["filename"]
+                        per_sample = d.get("per_sample_results", [])
+                        
+                        if not per_sample:
+                            joint_results.append({
+                                "Run": run_name,
+                                "Count": 0,
+                                "Joint Top-1": "N/A (No Sample Data)",
+                                "Joint Top-5": "N/A"
+                            })
+                            continue
+
+                        matches = []
+                        for s in per_sample:
+                            attrs = s.get("attributes", {})
+                            match_all = True
+                            for t in sel_hist_tags:
+                                if ": " not in t: 
+                                    match_all = False; break
+                                tk, tv = t.split(": ", 1)
+                                if tk not in attrs:
+                                    match_all = False; break
+                                av = attrs[tk]
+                                if isinstance(av, list):
+                                    if tv not in av: match_all = False; break
+                                else:
+                                    if str(av) != tv: match_all = False; break
+                            
+                            if match_all: matches.append(s)
+                        
+                        if not matches:
+                                joint_results.append({
+                                "Run": run_name,
+                                "Count": 0,
+                                "Joint Top-1": "0.00%",
+                                "Joint Top-5": "0.00%"
+                            })
+                        else:
+                            cnt = len(matches)
+                            acc1 = sum([m["hit1"] for m in matches]) / cnt
+                            acc5 = sum([m["hit5"] for m in matches]) / cnt
+                                
+                            joint_results.append({
+                                "Run": run_name,
+                                "Count": cnt,
+                                "Joint Top-1": f"{acc1:.2%}",
+                                "Joint Top-5": f"{acc5:.2%}"
+                            })
+                    
+                    st.table(pd.DataFrame(joint_results))
+
+            html_content += "</body></html>"
+
+            report_path = "comparison_report.html"
+            with open(report_path, "w") as f:
+                f.write(html_content)
+
+            st.success(f"Report generated: {report_path}")
+            st.markdown(f"[Download Report](./{report_path})", unsafe_allow_html=True)
