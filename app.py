@@ -135,18 +135,36 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         return None, "No items match the selected tags."
 
     # Prepare logic
+    # In I2T: classes are unique texts.
+    # In T2I: queries are item texts (duplicates allowed to preserve attribute mapping).
     unique_texts = get_unique_texts(filtered_items)
+
+    if mode == "t2i":
+        # For T2I, we use the text of each item as a query.
+        queries = [item.representative_text for item in filtered_items]
+        # We need to filter out items with no text? DataLoader usually ensures this or empty string.
+        # But let's be safe.
+        valid_indices = [i for i, q in enumerate(queries) if q]
+        queries = [queries[i] for i in valid_indices]
+        # We might need to filter filtered_items too if we rely on index alignment!
+        # Actually, filtered_items contains the attributes we need.
+        # If an item has no text, it can't be a T2I query.
+        filtered_items = [filtered_items[i] for i in valid_indices]
+
+        target_texts = queries # For T2I, this list aligns with filtered_items
+    else:
+        target_texts = unique_texts # For I2T, we classify into unique labels
 
     # Load Model
     model = CLIPModel(model_name, None, pretrained_tag, device, "eval_cache.pt")
     model.load()
 
     # Encode
-    image_paths = [item.image_path for item in filtered_items]
+    image_paths = [item.image_path for item in filtered_items] # Search space for T2I, Input for I2T
     image_features = model.encode_images(image_paths, 32)
 
     templates = ["{}"]
-    text_features = model.encode_texts(unique_texts, 32, templates)
+    text_features = model.encode_texts(target_texts, 32, templates)
 
     image_features = image_features.to(device)
     text_features = text_features.to(device)
@@ -157,15 +175,8 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     bad_cases = {}
 
     # Store per-item (or per-query) hit status for matrix breakdown
-    # format: list of tuples (is_top1, is_top5) corresponding to 'filtered_items' or 'unique_texts'
+    # format: list of tuples (is_top1, is_top5) corresponding to 'filtered_items'
     performance_records = []
-
-    text_to_item_indices = {}
-    for idx, item in enumerate(filtered_items):
-        t = item.representative_text
-        if t:
-            if t not in text_to_item_indices: text_to_item_indices[t] = []
-            text_to_item_indices[t].append(idx)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     debug_dir = None
@@ -203,17 +214,43 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
             performance_records.append((hit1, hit5))
 
     else: # T2I
+        # text_features is [N_queries, D] (aligned with filtered_items)
+        # image_features is [N_items, D] (search space)
         sims_t2i = text_features @ image_features.T
         k = min(5, sims_t2i.size(1))
         _, top_idx = sims_t2i.topk(k=k, dim=-1)
         pred_images = top_idx.cpu()
 
         metrics, per_class, bad_cases = compute_t2i_metrics(
-            pred_images, gt_class_sets, unique_texts
+            pred_images, gt_class_sets, target_texts
         )
 
-        for stats in per_class:
-            performance_records.append((stats["top1"], stats["top5"]))
+        # In T2I now, queries align 1-to-1 with filtered_items.
+        # So we can just iterate the queries to get performance records.
+        # But compute_t2i_metrics aggregates per-class stats?
+        # No, wait. compute_t2i_metrics returns global metrics and per-class stats.
+        # We need per-QUERY hit status for the matrix.
+        # The function internal logic calculates this.
+        # I should have modified compute_t2i_metrics to return per-query status or recalculate it here.
+        # Since I didn't change the signature to return raw hits, I will recalculate quickly here.
+        # Or I can just trust the order?
+
+        # Let's recalculate simply here to be safe and avoid API changes.
+        query_norms = [normalize_label(t) for t in target_texts]
+
+        for i in range(len(target_texts)):
+            q_norm = query_norms[i]
+            preds_idx = pred_images[i].tolist()
+
+            is_relevant = []
+            for img_idx in preds_idx:
+                gset = gt_class_sets[img_idx]
+                rel = 1.0 if q_norm in gset else 0.0
+                is_relevant.append(rel)
+
+            hit1 = is_relevant[0]
+            hit5 = 1.0 if sum(is_relevant) > 0 else 0.0
+            performance_records.append((hit1, hit5))
 
     # Save Debug if enabled
     if debug_mode and bad_cases:
@@ -223,27 +260,15 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     sample_tags = []
     all_tags = set()
 
-    if mode == "i2t":
-        for item in filtered_items:
-            tags = set()
-            for k, v in item.attributes.items():
-                if k != 'filename':
-                    tag = f"{k}: {v}"
-                    tags.add(tag)
-                    all_tags.add(tag)
-            sample_tags.append(tags)
-    else:
-        for idx, text in enumerate(unique_texts):
-            origin_indices = text_to_item_indices.get(text, [])
-            tags = set()
-            for oid in origin_indices:
-                item = filtered_items[oid]
-                for k, v in item.attributes.items():
-                    if k != 'filename':
-                        tag = f"{k}: {v}"
-                        tags.add(tag)
-                        all_tags.add(tag)
-            sample_tags.append(tags)
+    # Now logic is identical for both modes because we aligned queries to items in T2I
+    for item in filtered_items:
+        tags = set()
+        for k, v in item.attributes.items():
+            if k != 'filename':
+                tag = f"{k}: {v}"
+                tags.add(tag)
+                all_tags.add(tag)
+        sample_tags.append(tags)
 
     sorted_tags = sorted(list(all_tags))
 
@@ -343,7 +368,7 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     results = {
         "metrics": metrics,
         "cross_results": cross_results,
-        "n_samples": len(filtered_items) if mode == "i2t" else len(unique_texts),
+        "n_samples": len(filtered_items),
         "timestamp": timestamp,
         "model": model_name,
         "pretrained": pretrained,
@@ -380,7 +405,7 @@ def save_run(results):
     return path
 
 # --- Tabs ---
-tab1, tab2, tab3, tab4 = st.tabs(["Run Evaluation", "Debug View", "Auto-labeling", "History & Compare"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Run Evaluation", "Debug View", "Auto-labeling", "History & Compare", "Dataset Analysis"])
 
 with tab1:
     st.header("Run Evaluation")
@@ -654,6 +679,42 @@ with tab3:
             else:
                 st.error("Auto-labeling failed.")
                 st.text_area("Error", stderr)
+
+with tab5:
+    st.header("Dataset Analysis")
+    st.write("Analyze the distribution of tags in your dataset.")
+
+    if st.button("Load & Analyze Dataset", key="btn_analyze"):
+         if not os.path.exists(dataset_dir):
+            st.error("Dataset directory not found.")
+         else:
+            items = load_data(dataset_dir, mapping_path, filter_json_path)
+            st.success(f"Loaded {len(items)} items.")
+
+            # Aggregate Tags
+            tag_counts = {}
+            for item in items:
+                for k, v in item.attributes.items():
+                    if k == 'filename': continue
+                    if k not in tag_counts: tag_counts[k] = {}
+                    if v not in tag_counts[k]: tag_counts[k][v] = 0
+                    tag_counts[k][v] += 1
+
+            # Display
+            if not tag_counts:
+                st.warning("No tags found. Run Auto-labeling first.")
+            else:
+                for cat in sorted(tag_counts.keys()):
+                    st.subheader(f"Attribute: {cat}")
+                    data = tag_counts[cat]
+                    df = pd.DataFrame(list(data.items()), columns=["Value", "Count"])
+                    df = df.sort_values(by="Count", ascending=False)
+
+                    c1, c2 = st.columns([1, 2])
+                    with c1:
+                        st.dataframe(df, hide_index=True)
+                    with c2:
+                        st.bar_chart(df.set_index("Value"))
 
 with tab4:
     st.header("History & Compare")

@@ -119,7 +119,7 @@ def compute_metrics(
 def compute_t2i_metrics(
     pred_images: torch.Tensor, # [N_queries, k] - indices into images
     gt_class_sets: List[Set[str]], # [N_images] - GT sets for all images
-    query_texts: List[str],        # [N_queries] - The text queries
+    query_texts: List[str],        # [N_queries] - The text queries (might contain duplicates)
 ):
     """
     Computes top-k metrics for Text-to-Image (Search/Retrieval).
@@ -134,13 +134,6 @@ def compute_t2i_metrics(
     bad_cases = {} # Key: query index. Value: info about top-5 retrieved images.
     
     query_norms = [normalize_label(t) for t in query_texts]
-    
-    # Pre-count relevant images per query for "count" stats? 
-    # That requires O(N_queries * N_images) check. 
-    # We'll skip that for "count" and just use 1 (each query is 1 sample).
-    # Or we can count how many times this query appeared as a representative text? 
-    # Actually, in T2I, the "sample" is the query. 
-    # If we use unique_texts as queries, each query appears once.
     
     for i in range(N_queries):
         q_norm = query_norms[i]
@@ -178,18 +171,31 @@ def compute_t2i_metrics(
     global_top1 = correct_top1_t.mean().item()
     global_top5 = correct_top5_t.mean().item()
     
-    # Per-query stats
-    # Since queries are unique, each is its own "class" (or we group by text?)
-    # They are unique strings.
-    per_class_stats = []
+    # Per-class stats (Aggregating identical queries)
+    # We want to group stats by the query text to show "Class: cat" performance.
+
+    stats_map = {} # label -> {sum1, sum5, count}
     
-    # We can group by the text itself.
     for i in range(N_queries):
+        lbl = query_texts[i]
+        if lbl not in stats_map:
+            stats_map[lbl] = {"sum1": 0.0, "sum5": 0.0, "count": 0}
+
+        stats_map[lbl]["sum1"] += correct_top1[i]
+        stats_map[lbl]["sum5"] += correct_top5[i]
+        stats_map[lbl]["count"] += 1
+
+    per_class_stats = []
+    sorted_labels = sorted(stats_map.keys())
+
+    for lbl in sorted_labels:
+        d = stats_map[lbl]
+        c = d["count"]
         per_class_stats.append({
-            "label": query_texts[i],
-            "count": 1, # 1 query
-            "top1": correct_top1[i],
-            "top5": correct_top5[i]
+            "label": lbl,
+            "count": c,
+            "top1": d["sum1"] / c,
+            "top5": d["sum5"] / c
         })
         
     # Macro/Weighted are same since count is 1

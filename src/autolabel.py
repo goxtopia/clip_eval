@@ -95,6 +95,21 @@ class AutoLabeler:
             print(f"Error in YOLO processing for {image_path}: {e}")
             return "Error"
 
+    def _get_resolution_tag(self, image_path: str) -> str:
+        try:
+            img = cv2.imread(image_path)
+            if img is None: return "Unknown"
+            h, w = img.shape[:2]
+            # Threshold: if max dimension >= 1024, consider it High.
+            # This aligns with our resize limit (we resize down to 1024).
+            # If it's smaller than that, it's low res relative to our pipeline.
+            if max(h, w) >= 1024:
+                return "High"
+            else:
+                return "Low"
+        except Exception:
+            return "Unknown"
+
     def _get_vlm_attributes(self, image_path: str) -> Dict[str, str]:
         base64_image = self._encode_image(image_path)
 
@@ -102,7 +117,6 @@ class AutoLabeler:
         Analyze the image and provide the following attributes in JSON format:
         1. "time_of_day": "Day" or "Night"
         2. "is_blurry": "Yes" or "No"
-        3. "resolution": "High" or "Low" (Consider High if it looks sharp and detailed, Low otherwise)
 
         Output ONLY the JSON object.
         """
@@ -133,7 +147,7 @@ class AutoLabeler:
             return json.loads(content)
         except Exception as e:
             print(f"Error in VLM processing for {image_path}: {e}")
-            return {"time_of_day": "Unknown", "is_blurry": "Unknown", "resolution": "Unknown"}
+            return {"time_of_day": "Unknown", "is_blurry": "Unknown"}
 
     def run(self):
         images = [f for f in os.listdir(self.dataset_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
@@ -151,11 +165,13 @@ class AutoLabeler:
             print(f"Processing {i+1}/{total}: {img_name}")
 
             person_size = self._get_person_size(img_path)
+            resolution = self._get_resolution_tag(img_path)
             vlm_attrs = self._get_vlm_attributes(img_path)
 
             self.data[md5] = {
                 "filename": img_name,
                 "person_size": person_size,
+                "resolution": resolution,
                 **vlm_attrs
             }
 

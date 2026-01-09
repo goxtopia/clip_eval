@@ -23,7 +23,7 @@ This project is a CLIP Evaluation Tool designed to assess the performance of CLI
 -   **Optimization:** Resizes images to a maximum dimension of 1024px before sending to the VLM to reduce latency and cost.
 -   **Storage:** Attributes are stored keyed by the image's MD5 hash to avoid re-processing duplicates.
 
-### 3. History & Comparison (`app.py` - Tab 3)
+### 3. History & Comparison (`app.py` - Tab 4)
 -   **Comparison:** Allows users to select multiple past runs from the `history/` folder and choose a **Baseline Run**.
 -   **Reporting:** Generates a unified HTML report containing:
     -   A summary table of runs (Model, Samples, Top-1 Acc, Active Filters).
@@ -33,6 +33,13 @@ This project is a CLIP Evaluation Tool designed to assess the performance of CLI
         -   **Blue:** Positive difference (Improvement).
     -   Downloadable HTML report.
 -   **Visualization:** Displays a simple bar chart of Global Top-1 accuracy for selected runs.
+
+### 4. Dataset Analysis (`app.py` - Tab 5)
+-   **Function:** Analyzes and visualizes the distribution of attributes/tags within the dataset.
+-   **Features:**
+    -   Loads the dataset and filter JSON.
+    -   Aggregates counts for every attribute key-value pair.
+    -   Displays frequency tables and bar charts for each attribute category (e.g., Person Size distribution, Time of Day distribution).
 
 ## Project Structure
 -   `app.py`: Main Streamlit entry point. Handles UI, evaluation orchestration, and reporting.
