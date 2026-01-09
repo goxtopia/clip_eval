@@ -169,106 +169,113 @@ def render_history_compare_tab():
 
                 # Iterate for both Image and Text matrices
                 for cat in ["img", "txt"]:
-                    base_tags, base_m1, base_m5, base_cnt = get_matrix_map(baseline_data, cat)
-                    if base_tags is None: continue
-                    
-                    # Select Base Metric
-                    base_mat = base_m5 if hm_metric == "Top-5 Accuracy" else base_m1
-
-                    section_title = "Image Tag Interaction" if cat == "img" else "Text Tag Interaction"
-                    st.markdown(f"#### {section_title} - Delta Heatmaps")
-                    html_content += f"<h3>{section_title} ({hm_metric})</h3>"
-
-                    for d in comparison_data:
-                        if d["filename"] == baseline_data["filename"]:
-                            continue
-
-                        comp_tags, comp_m1, comp_m5, comp_cnt = get_matrix_map(d, cat)
-                        if comp_tags is None: continue
-
-                        # Select Comp Metric
-                        comp_mat = comp_m5 if hm_metric == "Top-5 Accuracy" else comp_m1
-
-                        # Union of tags
-                        all_comparison_tags = sorted(list(set(base_tags) | set(comp_tags)))
-
-                        # Reconstruct aligned matrices
-                        def align_matrix(tags, mat, all_tags, fill_val=np.nan):
-                            size = len(all_tags)
-                            aligned = np.full((size, size), fill_val)
-                            
-                            # If source matrix is None (legacy case), return NaNs
-                            if mat is None: return aligned
-
-                            # Create mapping from old idx to new idx
-                            old_to_new = {}
-                            for i, t in enumerate(tags):
-                                if t in all_tags:
-                                    old_to_new[i] = all_tags.index(t)
-
-                            for r in range(mat.shape[0]):
-                                for c in range(mat.shape[1]):
-                                    if r in old_to_new and c in old_to_new:
-                                        # boundary check
-                                        if r < mat.shape[0] and c < mat.shape[1]:
-                                            aligned[old_to_new[r], old_to_new[c]] = mat[r, c]
-                            return aligned
-
-                        m_base_aligned = align_matrix(base_tags, base_mat, all_comparison_tags)
-                        m_comp_aligned = align_matrix(comp_tags, comp_mat, all_comparison_tags)
+                    try:
+                        base_tags, base_m1, base_m5, base_cnt = get_matrix_map(baseline_data, cat)
+                        if not base_tags: continue
                         
-                        # Align counts for annotation
-                        cnt_aligned = align_matrix(comp_tags, comp_cnt, all_comparison_tags, fill_val=0)
+                        # Select Base Metric
+                        base_mat = base_m5 if hm_metric == "Top-5 Accuracy" else base_m1
 
-                        # Compute Delta
-                        delta_mat = m_comp_aligned - m_base_aligned
+                        section_title = "Image Tag Interaction" if cat == "img" else "Text Tag Interaction"
+                        st.markdown(f"#### {section_title} - Delta Heatmaps")
+                        html_content += f"<h3>{section_title} ({hm_metric})</h3>"
 
-                        # Prepare Annotations
-                        annot_labels = []
-                        for r in range(len(all_comparison_tags)):
-                            row_labels = []
-                            for c in range(len(all_comparison_tags)):
-                                val = delta_mat[r, c]
-                                if np.isnan(val):
-                                    row_labels.append("")
-                                else:
-                                    lbl = f"{val:+.1%}"
-                                    if show_support:
-                                        count = int(cnt_aligned[r, c])
-                                        lbl += f"\n({count})"
-                                    row_labels.append(lbl)
-                            annot_labels.append(row_labels)
-                        annot_labels = np.array(annot_labels)
+                        for d in comparison_data:
+                            try:
+                                if d["filename"] == baseline_data["filename"]:
+                                    continue
+
+                                comp_tags, comp_m1, comp_m5, comp_cnt = get_matrix_map(d, cat)
+                                if not comp_tags: continue
+
+                                # Select Comp Metric
+                                comp_mat = comp_m5 if hm_metric == "Top-5 Accuracy" else comp_m1
+
+                                # Union of tags
+                                all_comparison_tags = sorted(list(set(base_tags) | set(comp_tags)))
+                                if not all_comparison_tags: continue
+
+                                # Reconstruct aligned matrices
+                                def align_matrix(tags, mat, all_tags, fill_val=np.nan):
+                                    size = len(all_tags)
+                                    aligned = np.full((size, size), fill_val)
+                                    
+                                    # If source matrix is None (legacy case), return NaNs
+                                    if mat is None: return aligned
+
+                                    # Create mapping from old idx to new idx
+                                    old_to_new = {}
+                                    for i, t in enumerate(tags):
+                                        if t in all_tags:
+                                            old_to_new[i] = all_tags.index(t)
+
+                                    for r in range(mat.shape[0]):
+                                        for c in range(mat.shape[1]):
+                                            if r in old_to_new and c in old_to_new:
+                                                # boundary check
+                                                if r < mat.shape[0] and c < mat.shape[1]:
+                                                    aligned[old_to_new[r], old_to_new[c]] = mat[r, c]
+                                    return aligned
+
+                                m_base_aligned = align_matrix(base_tags, base_mat, all_comparison_tags)
+                                m_comp_aligned = align_matrix(comp_tags, comp_mat, all_comparison_tags)
+                                
+                                # Align counts for annotation
+                                cnt_aligned = align_matrix(comp_tags, comp_cnt, all_comparison_tags, fill_val=0)
+
+                                # Compute Delta
+                                delta_mat = m_comp_aligned - m_base_aligned
+
+                                # Prepare Annotations
+                                annot_labels = []
+                                for r in range(len(all_comparison_tags)):
+                                    row_labels = []
+                                    for c in range(len(all_comparison_tags)):
+                                        val = delta_mat[r, c]
+                                        if np.isnan(val):
+                                            row_labels.append("")
+                                        else:
+                                            lbl = f"{val:+.1%}"
+                                            if show_support:
+                                                count = int(cnt_aligned[r, c])
+                                                lbl += f"\n({count})"
+                                            row_labels.append(lbl)
+                                    annot_labels.append(row_labels)
+                                annot_labels = np.array(annot_labels)
 
 
-                        # Plot
-                        fig, ax = plt.subplots(figsize=(10, len(all_comparison_tags)*0.5 + 2))
-                        sns.heatmap(
-                            delta_mat,
-                            annot=annot_labels,
-                            fmt="",
-                            xticklabels=all_comparison_tags,
-                            yticklabels=all_comparison_tags,
-                            cmap=cmap_delta,
-                            center=0,
-                            vmin=-0.2, vmax=0.2, # Adjust range for better visibility
-                            ax=ax
-                        )
-                        metric_short = "Top5" if hm_metric == "Top-5 Accuracy" else "Top1"
-                        plt.title(f"Delta {metric_short} ({cat}): {d['filename']} - Baseline")
-                        plt.xticks(rotation=45, ha="right")
+                                # Plot
+                                fig, ax = plt.subplots(figsize=(10, len(all_comparison_tags)*0.5 + 2))
+                                sns.heatmap(
+                                    delta_mat,
+                                    annot=annot_labels,
+                                    fmt="",
+                                    xticklabels=all_comparison_tags,
+                                    yticklabels=all_comparison_tags,
+                                    cmap=cmap_delta,
+                                    center=0,
+                                    vmin=-0.2, vmax=0.2, # Adjust range for better visibility
+                                    ax=ax
+                                )
+                                metric_short = "Top5" if hm_metric == "Top-5 Accuracy" else "Top1"
+                                plt.title(f"Delta {metric_short} ({cat}): {d['filename']} - Baseline")
+                                plt.xticks(rotation=45, ha="right")
 
-                        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        safe_name = d['filename'].replace(".json", "")
-                        delta_path = os.path.join(HISTORY_DIR, f"delta_{cat}_{metric_short}_{safe_name}_vs_base_{ts_str}.png")
-                        plt.savefig(delta_path, bbox_inches="tight")
-                        plt.close(fig)
+                                ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                safe_name = d['filename'].replace(".json", "")
+                                delta_path = os.path.join(HISTORY_DIR, f"delta_{cat}_{metric_short}_{safe_name}_vs_base_{ts_str}.png")
+                                plt.savefig(delta_path, bbox_inches="tight")
+                                plt.close(fig)
 
-                        st.write(f"**{d['filename']}** vs Baseline")
-                        st.image(delta_path)
+                                st.write(f"**{d['filename']}** vs Baseline")
+                                st.image(delta_path)
 
-                        html_content += f"<h4>{d['filename']} vs Baseline</h4>"
-                        html_content += f"<img src='{os.path.basename(delta_path)}' style='max-width:100%;'><br>"
+                                html_content += f"<h4>{d['filename']} vs Baseline</h4>"
+                                html_content += f"<img src='{os.path.basename(delta_path)}' style='max-width:100%;'><br>"
+                            except Exception as e:
+                                st.error(f"Error processing {d['filename']} for {cat}: {e}")
+                    except Exception as e:
+                         st.error(f"Error preparing baseline for {cat}: {e}")
 
             # --- Saved Queries Analysis (History) ---
             st.divider()
