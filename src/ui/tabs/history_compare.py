@@ -128,23 +128,37 @@ def render_history_compare_tab():
                     if "cross_results" not in data: return None, None, None, None
                     cr = data["cross_results"]
                     
+                    # Helper to safely create array
+                    def safe_arr(source, key, dtype):
+                        val = source.get(key)
+                        if val is None: return None
+                        try:
+                            return np.array(val, dtype=dtype)
+                        except:
+                            return None
+
                     # New Structure
                     if cat_key in cr and "tags" in cr[cat_key]:
                         d = cr[cat_key]
                         return (
-                            d["tags"], 
-                            np.array(d.get("matrix_top1"), dtype=float),
-                            np.array(d.get("matrix_top5"), dtype=float),
-                            np.array(d.get("matrix_counts"), dtype=int) if "matrix_counts" in d else None
+                            d.get("tags", []), 
+                            safe_arr(d, "matrix_top1", float),
+                            safe_arr(d, "matrix_top5", float),
+                            safe_arr(d, "matrix_counts", int)
                         )
                     
                     # Legacy fallback
                     if cat_key == "img" and "tags" in cr:
+                        # For legacy, we fallback top5 to top1 if missing
+                        m1 = safe_arr(cr, "matrix_top1", float)
+                        m5 = safe_arr(cr, "matrix_top5", float)
+                        if m5 is None: m5 = m1
+                        
                         return (
-                            cr["tags"], 
-                            np.array(cr["matrix_top1"], dtype=float),
-                            np.array(cr.get("matrix_top5", cr["matrix_top1"]), dtype=float), # fallback if missing
-                            np.array(cr.get("matrix_counts"), dtype=int) if "matrix_counts" in cr else None 
+                            cr.get("tags", []), 
+                            m1,
+                            m5, 
+                            safe_arr(cr, "matrix_counts", int) # Singular 'matrix_count' handling might be needed if really old, but sticking to plural based on recent fix
                         )
 
                     return None, None, None, None
