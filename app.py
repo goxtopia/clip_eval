@@ -337,6 +337,7 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         "n_samples": len(filtered_items) if mode == "i2t" else len(unique_texts),
         "timestamp": timestamp,
         "model": model_name,
+        "pretrained": pretrained,
         "filters": selected_filters,
         "mode": mode,
         "debug_dir": debug_dir
@@ -346,7 +347,9 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
 
 def save_run(results):
     ts = results["timestamp"]
-    fname = f"run_{ts}.json"
+    model = results.get("model", "unknown").replace("/", "_").replace(" ", "_")
+    tag = results.get("pretrained", "unknown").replace("/", "_").replace(" ", "_")
+    fname = f"run_{model}_{tag}_{ts}.json"
     path = os.path.join(HISTORY_DIR, fname)
     with open(path, "w") as f:
         # We need to handle np.nan for JSON dump
