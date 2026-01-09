@@ -133,9 +133,9 @@ def render_history_compare_tab():
                         d = cr[cat_key]
                         return (
                             d["tags"], 
-                            np.array(d["matrix_top1"], dtype=float),
-                            np.array(d["matrix_top5"], dtype=float),
-                            np.array(d["matrix_count"], dtype=int)
+                            np.array(d.get("matrix_top1"), dtype=float),
+                            np.array(d.get("matrix_top5"), dtype=float),
+                            np.array(d.get("matrix_counts"), dtype=int) if "matrix_counts" in d else None
                         )
                     
                     # Legacy fallback
@@ -144,7 +144,7 @@ def render_history_compare_tab():
                             cr["tags"], 
                             np.array(cr["matrix_top1"], dtype=float),
                             np.array(cr.get("matrix_top5", cr["matrix_top1"]), dtype=float), # fallback if missing
-                            np.array(cr.get("matrix_count", []), dtype=int) if "matrix_count" in cr else None 
+                            np.array(cr.get("matrix_counts"), dtype=int) if "matrix_counts" in cr else None 
                         )
 
                     return None, None, None, None
