@@ -22,19 +22,29 @@ class DatasetItem:
         self.attributes = attributes or {}
 
 class DataLoader:
-    def __init__(self, data_dir: str, mapper: LabelMapper, seed: int = 42, filter_json_path: str = None):
+    def __init__(self, data_dir: str, mapper: LabelMapper, seed: int = 42, filter_json_path: str = None, text_json_path: str = None):
         self.data_dir = data_dir
         self.mapper = mapper
         self.rng = random.Random(seed)
         self.filter_json_path = filter_json_path
+        self.text_json_path = text_json_path
         self.items: List[DatasetItem] = []
         self.filter_data = {}
+        self.text_attributes = {}
+
         if self.filter_json_path and os.path.exists(self.filter_json_path):
             try:
                 with open(self.filter_json_path, 'r', encoding='utf-8') as f:
                     self.filter_data = json.load(f)
             except Exception as e:
                 print(f"[Error] Failed to load filter JSON: {e}")
+
+        if self.text_json_path and os.path.exists(self.text_json_path):
+            try:
+                with open(self.text_json_path, 'r', encoding='utf-8') as f:
+                    self.text_attributes = json.load(f)
+            except Exception as e:
+                print(f"[Error] Failed to load text attributes JSON: {e}")
 
     def _calculate_md5(self, filepath: str) -> str:
         hash_md5 = hashlib.md5()
@@ -70,10 +80,16 @@ class DataLoader:
             # Calculate MD5
             md5 = self._calculate_md5(img_path)
 
-            # Get attributes from filter data
+            # Get attributes from filter data (Image attributes)
             # Key could be image name or md5, we check both. Prioritize MD5.
             img_name = os.path.basename(img_path)
             attributes = self.filter_data.get(md5) or self.filter_data.get(img_name) or {}
+            
+            # Get text attributes
+            text_attrs = self.text_attributes.get(rep_text, {})
+            
+            # Merge attributes (Text attributes overwrite Image attributes if conflict, but keys should be distinct)
+            attributes.update(text_attrs)
 
             items.append(DatasetItem(img_path, txt_path, valid_lines, expanded_gt, rep_text, md5, attributes))
             

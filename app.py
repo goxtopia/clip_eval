@@ -33,6 +33,7 @@ dataset_dir = st.sidebar.text_input("Dataset Directory", "data")
 model_name = st.sidebar.text_input("Model Name/ID", "MobileCLIP-S2")
 pretrained_tag = st.sidebar.text_input("Pretrained Tag", "openai")
 filter_json_path = st.sidebar.text_input("Tag JSON Path", "filter_attributes.json")
+text_json_path = st.sidebar.text_input("Text Tag JSON Path", "text_attributes.json")
 mapping_path = st.sidebar.text_input("Mapping JSON Path", "mapping.json")
 
 st.sidebar.markdown("### Auto-labeling Config")
@@ -43,9 +44,9 @@ vlm_model = st.sidebar.text_input("VLM Model Name", "gpt-4o-mini")
 # --- Functions ---
 
 @st.cache_data
-def load_data(data_dir, mapping, filter_path):
+def load_data(data_dir, mapping, filter_path, text_path):
     mapper = LabelMapper(mapping)
-    loader = DataLoader(data_dir, mapper, filter_json_path=filter_path)
+    loader = DataLoader(data_dir, mapper, filter_json_path=filter_path, text_json_path=text_path)
     return loader.load()
 
 def save_debug_cases(items, bad_cases, mode, timestamp):
@@ -125,7 +126,16 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
             if not desired_values: continue
 
             val = item.attributes.get(key, "Unknown")
-            if val not in desired_values:
+            
+            # Helper to check membership
+            def check_match(val, desired):
+                if isinstance(val, list):
+                    # If val is list, match if ANY element is in desired_values
+                    return any(v in desired for v in val)
+                else:
+                    return val in desired
+
+            if not check_match(val, desired_values):
                 match = False
                 break
         if match:
@@ -257,117 +267,136 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         debug_dir = save_debug_cases(filtered_items, bad_cases, mode, timestamp)
 
     # --- Cross-Attribute Matrix Calculation ---
-    sample_tags = []
-    all_tags = set()
+    sample_tags_img = []
+    sample_tags_txt = []
+    
+    all_tags_img = set()
+    all_tags_txt = set()
 
-    # Now logic is identical for both modes because we aligned queries to items in T2I
     for item in filtered_items:
-        tags = set()
+        tags_img = set()
+        tags_txt = set()
         for k, v in item.attributes.items():
-            if k != 'filename':
-                tag = f"{k}: {v}"
-                tags.add(tag)
-                all_tags.add(tag)
-        sample_tags.append(tags)
+            if k == 'filename': continue
+            
+            vals = v if isinstance(v, list) else [v]
+            for val in vals:
+                tag = f"{k}: {val}"
+                if k.startswith("Text "):
+                    tags_txt.add(tag)
+                    all_tags_txt.add(tag)
+                else:
+                    tags_img.add(tag)
+                    all_tags_img.add(tag)
+        
+        sample_tags_img.append(tags_img)
+        sample_tags_txt.append(tags_txt)
 
-    sorted_tags = sorted(list(all_tags))
+    def compute_matrix(all_tags, sample_tags, perf_records):
+        sorted_tags = sorted(list(all_tags))
+        matrix_data = {}
+        for i in range(len(perf_records)):
+            p_rec = perf_records[i]
+            tags = sample_tags[i]
+            tags_list = list(tags)
+            for t1 in tags_list:
+                for t2 in tags_list:
+                    if ": " in t1 and ": " in t2:
+                        k1, v1 = t1.split(": ", 1)
+                        k2, v2 = t2.split(": ", 1)
+                        if k1 == k2 and v1 != v2: continue
+                    key = (t1, t2)
+                    if key not in matrix_data: matrix_data[key] = {"sum1": 0.0, "sum5": 0.0, "count": 0}
+                    matrix_data[key]["sum1"] += p_rec[0]
+                    matrix_data[key]["sum5"] += p_rec[1]
+                    matrix_data[key]["count"] += 1
+        return sorted_tags, matrix_data
 
-    cross_matrix_data = {} # Key: (tag_i, tag_j) -> {sum1, sum5, count}
+    # Compute Image Matrix
+    img_sorted, img_data = compute_matrix(all_tags_img, sample_tags_img, performance_records)
+    # Compute Text Matrix
+    txt_sorted, txt_data = compute_matrix(all_tags_txt, sample_tags_txt, performance_records)
 
-    for i in range(len(performance_records)):
-        p_rec = performance_records[i]
-        tags = sample_tags[i]
-
-        tags_list = list(tags)
-        for t1 in tags_list:
-            for t2 in tags_list:
-                # NEW LOGIC START: Prevent mutually exclusive tag intersections
-                # If tags have format "Key: Value" and share same Key but diff Value, skip.
-                if ": " in t1 and ": " in t2:
-                    k1, v1 = t1.split(": ", 1)
-                    k2, v2 = t2.split(": ", 1)
-                    if k1 == k2 and v1 != v2:
-                        continue
-                # NEW LOGIC END
-
+    def build_grid(sorted_tags, matrix_data):
+        m1, m5, mc = [], [], []
+        for t1 in sorted_tags:
+            r1, r5, rc = [], [], []
+            for t2 in sorted_tags:
                 key = (t1, t2)
-                if key not in cross_matrix_data:
-                    cross_matrix_data[key] = {"sum1": 0.0, "sum5": 0.0, "count": 0}
+                if key in matrix_data:
+                    d = matrix_data[key]
+                    r1.append(d["sum1"] / d["count"])
+                    r5.append(d["sum5"] / d["count"])
+                    rc.append(d["count"])
+                else:
+                    r1.append(np.nan)
+                    r5.append(np.nan)
+                    rc.append(0)
+            m1.append(r1)
+            m5.append(r5)
+            mc.append(rc)
+        return m1, m5, mc
 
-                cross_matrix_data[key]["sum1"] += p_rec[0]
-                cross_matrix_data[key]["sum5"] += p_rec[1]
-                cross_matrix_data[key]["count"] += 1
+    img_m1, img_m5, img_mc = build_grid(img_sorted, img_data)
+    txt_m1, txt_m5, txt_mc = build_grid(txt_sorted, txt_data)
 
-    matrix_top1 = []
-    matrix_top5 = []
-    matrix_counts = [] # Added for mixing heatmap
-
-    # This loop generates the FULL matrix (all vs all)
-    # We will still compute it for completeness in 'cross_results' if needed,
-    # or we can just compute the sub-matrices for display.
-    # The existing code computes the full NxN.
-    # We can keep it to support the "old" view if needed, or just for data structure consistency.
-    
-    print(sorted_tags)
-    
-    for t1 in sorted_tags:
-        row1 = []
-        row5 = []
-        row_c = []
-        for t2 in sorted_tags:
-            key = (t1, t2)
-            if key in cross_matrix_data:
-                d = cross_matrix_data[key]
-                avg1 = d["sum1"] / d["count"]
-                avg5 = d["sum5"] / d["count"]
-                row1.append(avg1)
-                row5.append(avg5)
-                row_c.append(d["count"])
-            else:
-                row1.append(np.nan) 
-                row5.append(np.nan)
-                row_c.append(0)
-        matrix_top1.append(row1)
-        matrix_top5.append(row5)
-        matrix_counts.append(row_c)
-
-    # Collect per-tag stats (diagonal)
+    # Collect per-tag stats (merged for the table)
     tag_stats = []
-    for t in sorted_tags:
-        key = (t, t)
-        if key in cross_matrix_data:
-            d = cross_matrix_data[key]
-            acc1 = d["sum1"] / d["count"]
-            acc5 = d["sum5"] / d["count"]
-            tag_stats.append({
-                "Tag": t,
-                "Count": d["count"],
-                "ACC1": acc1,
-                "ACC5": acc5
-            })
+    for tags, data in [(img_sorted, img_data), (txt_sorted, txt_data)]:
+        for t in tags:
+            key = (t, t)
+            if key in data:
+                d = data[key]
+                tag_stats.append({
+                    "Tag": t,
+                    "Count": d["count"],
+                    "ACC1": d["sum1"] / d["count"],
+                    "ACC5": d["sum5"] / d["count"]
+                })
+
+    def get_groups(tags):
+        groups = {}
+        for t in tags:
+            if ": " in t:
+                k, _ = t.split(": ", 1)
+                if k not in groups: groups[k] = []
+                groups[k].append(t)
+        return groups
 
     cross_results = {
-        "tags": sorted_tags,
-        "matrix_top1": matrix_top1,
-        "matrix_top5": matrix_top5,
-        "matrix_counts": matrix_counts, 
-        "tag_stats": tag_stats 
+        "tag_stats": tag_stats,
+        "img": {
+            "tags": img_sorted, "matrix_top1": img_m1, "matrix_top5": img_m5, "matrix_counts": img_mc,
+            "tag_groups": get_groups(img_sorted)
+        },
+        "txt": {
+            "tags": txt_sorted, "matrix_top1": txt_m1, "matrix_top5": txt_m5, "matrix_counts": txt_mc,
+            "tag_groups": get_groups(txt_sorted)
+        }
     }
 
-    # Identify Tag Groups
-    # Extract keys from "Key: Value" tags
-    tag_groups = {}
-    for t in sorted_tags:
-        if ": " in t:
-            k, v = t.split(": ", 1)
-            if k not in tag_groups: tag_groups[k] = []
-            tag_groups[k].append(t)
-    
-    cross_results["tag_groups"] = tag_groups
+    # Prepare Per-Sample Results for Joint Analysis
+    per_sample_results = []
+    # Using filtered_items loop again
+    for i, item in enumerate(filtered_items):
+        rec = performance_records[i]
+        # Flatten attributes for JSON
+        attrs_flat = {}
+        for k, v in item.attributes.items():
+             if k != 'filename':
+                 attrs_flat[k] = v # Can be list or scalar
+        
+        per_sample_results.append({
+            "id": i,
+            "hit1": rec[0],
+            "hit5": rec[1],
+            "attributes": attrs_flat
+        })
 
     results = {
         "metrics": metrics,
         "cross_results": cross_results,
+        "per_sample_results": per_sample_results, # NEW
         "n_samples": len(filtered_items),
         "timestamp": timestamp,
         "model": model_name,
@@ -414,7 +443,7 @@ with tab1:
         if not os.path.exists(dataset_dir):
             st.error("Dataset directory not found.")
         else:
-            items = load_data(dataset_dir, mapping_path, filter_json_path)
+            items = load_data(dataset_dir, mapping_path, filter_json_path, text_json_path)
             st.session_state["items"] = items
             st.success(f"Loaded {len(items)} items.")
 
@@ -435,7 +464,11 @@ with tab1:
         for item in items:
             for k, v in item.attributes.items():
                 if k not in filter_options: filter_options[k] = set()
-                filter_options[k].add(v)
+                if isinstance(v, list):
+                    for sub_v in v:
+                        filter_options[k].add(sub_v)
+                else:
+                    filter_options[k].add(v)
 
         # Display Filters
         st.subheader("Tags")
@@ -483,14 +516,24 @@ with tab1:
             # --- Tag Mixing Matrix ---
             st.subheader("Tag Mixing Matrix (Accuracy)")
             
-            tags = cross.get("tags", [])
-            tag_groups = cross.get("tag_groups", {})
-            print(f"Tag Groups Found: {tag_groups.keys()}")
-            m1 = cross.get("matrix_top1", [])
-            m5 = cross.get("matrix_top5", [])
+            cross = res.get("cross_results", {})
+            
+            # Helper for heatmap
             ts_str = res.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
+            
+            def plot_matrices(cat_key, title_prefix):
+                cat_data = cross.get(cat_key, {})
+                tags = cat_data.get("tags", [])
+                tag_groups = cat_data.get("tag_groups", {})
+                m1 = cat_data.get("matrix_top1", [])
+                m5 = cat_data.get("matrix_top5", [])
+                counts = cat_data.get("matrix_counts", [])
+                
+                if not tags or not m1:
+                    st.info(f"No {title_prefix} tags interaction data.")
+                    return
 
-            if tags and m1:
+                # Convert to numpy
                 def to_float_array(arr):
                     narr = np.array(arr, dtype=object) 
                     narr[narr == None] = np.nan
@@ -498,19 +541,12 @@ with tab1:
 
                 m1_arr = to_float_array(m1)
                 m5_arr = to_float_array(m5)
+                counts_arr = np.array(counts)
 
-                counts_arr = np.array(cross.get("matrix_counts", []))
-
-                # Iterate over groups to create sub-matrices
-                # If no groups found (no ": " in tags), fallback to full matrix?
-                # The prompt implies structured tags. If simple tags, maybe just one group.
-                
-                # Ensure "All" is always present and first
                 groups_to_plot = ["All"] + sorted(list(tag_groups.keys()))
                 
                 for grp in groups_to_plot:
-                    print(f"Processing group: {grp}")
-                    st.markdown(f"#### Group: {grp}")
+                    st.markdown(f"#### {title_prefix} - Group: {grp}")
                     
                     if grp == "All":
                          row_indices = range(len(tags))
@@ -518,9 +554,7 @@ with tab1:
                          sub_tags_row = tags
                          sub_tags_col = tags
                     else:
-                        # Row indices: tags in this group
                         row_indices = [i for i, t in enumerate(tags) if t in tag_groups[grp]]
-                        # Col indices: tags NOT in this group
                         col_indices = [i for i, t in enumerate(tags) if t not in tag_groups[grp]]
                         
                         sub_tags_row = [tags[i] for i in row_indices]
@@ -530,16 +564,11 @@ with tab1:
                         st.write("No interactions with outside groups.")
                         continue
 
-                    # Extract sub-arrays
-                    # m1_arr[row_indices, :][:, col_indices]
-                    # numpy advanced indexing
                     sub_m1 = m1_arr[np.ix_(row_indices, col_indices)]
                     sub_m5 = m5_arr[np.ix_(row_indices, col_indices)]
                     sub_counts = counts_arr[np.ix_(row_indices, col_indices)]
                     
-                    # Prepare annotations
                     if show_support:
-                        # Create annotation matrix
                         annot_m1 = np.empty(sub_m1.shape, dtype=object)
                         annot_m5 = np.empty(sub_m5.shape, dtype=object)
                         for r in range(sub_m1.shape[0]):
@@ -547,73 +576,105 @@ with tab1:
                                 count = int(sub_counts[r, c])
                                 val1 = sub_m1[r, c]
                                 val5 = sub_m5[r, c]
-
-                                if np.isnan(val1):
-                                    annot_m1[r, c] = ""
-                                else:
-                                    annot_m1[r, c] = f"{val1:.1%}\n({count})"
-
-                                if np.isnan(val5):
-                                    annot_m5[r, c] = ""
-                                else:
-                                    annot_m5[r, c] = f"{val5:.1%}\n({count})"
-
-                        annot1 = annot_m1
-                        annot5 = annot_m5
-                        fmt = "" # format is handled in annot strings
+                                annot_m1[r, c] = "" if np.isnan(val1) else f"{val1:.1%}\n({count})"
+                                annot_m5[r, c] = "" if np.isnan(val5) else f"{val5:.1%}\n({count})"
+                        annot1, annot5, fmt = annot_m1, annot_m5, ""
                     else:
-                        annot1 = True
-                        annot5 = True
-                        fmt = ".1%"
+                        annot1, annot5, fmt = True, True, ".1%"
 
-                    # Create Tabs for this group
                     mtab1, mtab2 = st.tabs([f"{grp} Top-1", f"{grp} Top-5"])
                     
-                    # Generate and Save Top-1
-                    fig1, ax1 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
-                    sns.heatmap(
-                        sub_m1,
-                        annot=annot1,
-                        fmt=fmt,
-                        xticklabels=sub_tags_col,
-                        yticklabels=sub_tags_row,
-                        cmap="Blues",
-                        ax=ax1,
-                        vmin=0, vmax=1
-                    )
-                    plt.xticks(rotation=45, ha="right")
-                    plt.title(f"{grp} Interaction Top-1")
-                    
-                    safe_grp = grp.replace(" ", "_").replace("/", "_")
-                    path_top1 = os.path.join(HISTORY_DIR, f"heatmap_{safe_grp}_top1_{ts_str}.png")
-                    plt.savefig(path_top1, bbox_inches="tight")
-                    
-                    # Generate and Save Top-5
-                    fig2, ax2 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
-                    sns.heatmap(
-                        sub_m5,
-                        annot=annot5,
-                        fmt=fmt,
-                        xticklabels=sub_tags_col,
-                        yticklabels=sub_tags_row,
-                        cmap="Blues",
-                        ax=ax2,
-                        vmin=0, vmax=1
-                    )
-                    plt.xticks(rotation=45, ha="right")
-                    plt.title(f"{grp} Interaction Top-5")
-                    
-                    path_top5 = os.path.join(HISTORY_DIR, f"heatmap_{safe_grp}_top5_{ts_str}.png")
-                    plt.savefig(path_top5, bbox_inches="tight")
-                    
-                    with mtab1:
-                        st.image(path_top1)
-                    with mtab2:
-                        st.image(path_top5)
+                    # Plotting helper
+                    def plot_hm(data, annot, ax, title):
+                        sns.heatmap(data, annot=annot, fmt=fmt, xticklabels=sub_tags_col, yticklabels=sub_tags_row, cmap="Blues", ax=ax, vmin=0, vmax=1)
+                        ax.set_title(title)
+                        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
 
+                    fig1, ax1 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
+                    plot_hm(sub_m1, annot1, ax1, f"{title_prefix} {grp} Top-1")
+                    safe_grp = grp.replace(" ", "_").replace("/", "_")
+                    path_top1 = os.path.join(HISTORY_DIR, f"hm_{title_prefix}_{safe_grp}_1_{ts_str}.png")
+                    plt.savefig(path_top1, bbox_inches="tight")
                     plt.close(fig1)
+
+                    fig2, ax2 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
+                    plot_hm(sub_m5, annot5, ax2, f"{title_prefix} {grp} Top-5")
+                    path_top5 = os.path.join(HISTORY_DIR, f"hm_{title_prefix}_{safe_grp}_5_{ts_str}.png")
+                    plt.savefig(path_top5, bbox_inches="tight")
                     plt.close(fig2)
-                    print(f"Finished group: {grp}")
+
+                    with mtab1: st.image(path_top1)
+                    with mtab2: st.image(path_top5)
+
+            hm_tab1, hm_tab2 = st.tabs(["Image Tags Heatmap", "Text Tags Heatmap"])
+            with hm_tab1:
+                plot_matrices("img", "Image")
+            with hm_tab2:
+                plot_matrices("txt", "Text")
+
+
+            # --- Joint Tag Analysis ---
+            st.divider()
+            with st.expander("Joint Tag Analysis (Intersection)"):
+                # Collect all available tags from this run
+                idx_to_tag = {}
+                all_avail_tags = set()
+                
+                # Check cross results for tags
+                for cat in ["img", "txt"]:
+                    if cat in cross:
+                        all_avail_tags.update(cross[cat].get("tags", []))
+                
+                sorted_avail = sorted(list(all_avail_tags))
+                sel_joint_tags = st.multiselect("Select Tags to Combine (Intersection)", sorted_avail, key="joint_res")
+                
+                if st.button("Calculate Joint Accuracy", key="btn_joint_res"):
+                    if not sel_joint_tags:
+                        st.warning("Select at least one tag.")
+                    else:
+                        # Process per_sample_results
+                        per_sample = res.get("per_sample_results", [])
+                        matches = []
+                        for s in per_sample:
+                            attrs = s.get("attributes", {})
+                            # Check if ALL selected tags are present
+                            # Attributes dict has {key: val} or {key: [vals]}
+                            # Tag format is "Key: Value"
+                            
+                            match_all = True
+                            for t in sel_joint_tags:
+                                if ": " not in t: 
+                                    match_all = False
+                                    break
+                                tk, tv = t.split(": ", 1)
+                                
+                                if tk not in attrs:
+                                    match_all = False
+                                    break
+                                
+                                av = attrs[tk]
+                                if isinstance(av, list):
+                                    if tv not in av:
+                                        match_all = False
+                                        break
+                                else:
+                                    if str(av) != tv:
+                                        match_all = False
+                                        break
+                            
+                            if match_all:
+                                matches.append(s)
+                        
+                        if not matches:
+                            st.warning("No samples match ALL selected tags.")
+                        else:
+                            cnt = len(matches)
+                            acc1 = sum([m["hit1"] for m in matches]) / cnt
+                            acc5 = sum([m["hit5"] for m in matches]) / cnt
+                            st.metric("Joint Count", cnt)
+                            st.metric("Joint Top-1", f"{acc1:.2%}")
+                            st.metric("Joint Top-5", f"{acc5:.2%}")
+
 
 
 with tab2:
@@ -680,6 +741,29 @@ with tab3:
                 st.error("Auto-labeling failed.")
                 st.text_area("Error", stderr)
 
+    st.divider()
+    st.markdown("### Text Auto-labeling")
+    if st.button("Start Text Auto-labeling"):
+        cmd = [
+            sys.executable, "src/autolabel_text.py",
+            "--dataset", dataset_dir,
+            "--output", text_json_path,
+            "--api_url", api_url,
+            "--api_key", api_key,
+            "--model", vlm_model
+        ]
+
+        with st.spinner("Labeling Text... check terminal for progress logs."):
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout, stderr = process.communicate()
+
+            if process.returncode == 0:
+                st.success("Text Auto-labeling complete!")
+                st.text_area("Output", stdout)
+            else:
+                st.error("Text Auto-labeling failed.")
+                st.text_area("Error", stderr)
+
 with tab5:
     st.header("Dataset Analysis")
     st.write("Analyze the distribution of tags in your dataset.")
@@ -688,7 +772,7 @@ with tab5:
          if not os.path.exists(dataset_dir):
             st.error("Dataset directory not found.")
          else:
-            items = load_data(dataset_dir, mapping_path, filter_json_path)
+            items = load_data(dataset_dir, mapping_path, filter_json_path, text_json_path)
             st.success(f"Loaded {len(items)} items.")
 
             # Aggregate Tags
@@ -697,8 +781,11 @@ with tab5:
                 for k, v in item.attributes.items():
                     if k == 'filename': continue
                     if k not in tag_counts: tag_counts[k] = {}
-                    if v not in tag_counts[k]: tag_counts[k][v] = 0
-                    tag_counts[k][v] += 1
+                    
+                    vals = v if isinstance(v, list) else [v]
+                    for val in vals:
+                        if val not in tag_counts[k]: tag_counts[k][val] = 0
+                        tag_counts[k][val] += 1
 
             # Display
             if not tag_counts:
@@ -905,6 +992,84 @@ with tab4:
 
                         html_content += f"<h3>{d['filename']} vs Baseline</h3>"
                         html_content += f"<img src='{os.path.basename(delta_path)}' style='max-width:100%;'><br>"
+
+            # --- Interactive Joint Analysis (History) ---
+            st.divider()
+            st.subheader("Joint Tag Analysis (Interactive)")
+            st.write("Compare joint accuracy across selected runs by selecting intersecting tags.")
+
+            # Collect tags from all runs
+            all_hist_tags = set()
+            for d in comparison_data:
+                # Check cross_results
+                res_img = d.get("cross_results", {}).get("img", {}) # New structure
+                res_txt = d.get("cross_results", {}).get("txt", {})
+                
+                if res_img: all_hist_tags.update(res_img.get("tags", []))
+                if res_txt: all_hist_tags.update(res_txt.get("tags", []))
+                
+                # Check old structure fallback
+                old_tags = d.get("cross_results", {}).get("tags", [])
+                if old_tags: all_hist_tags.update(old_tags)
+            
+            sel_hist_tags = st.multiselect("Select Tags to Combine", sorted(list(all_hist_tags)), key="hist_joint")
+
+            if st.button("Calculate Joint Accuracy (History)", key="btn_hist_joint"):
+                if not sel_hist_tags:
+                    st.warning("Select at least one tag.")
+                else:
+                    joint_results = []
+                    for d in comparison_data:
+                        run_name = d["filename"]
+                        per_sample = d.get("per_sample_results", [])
+                        
+                        if not per_sample:
+                            joint_results.append({
+                                "Run": run_name,
+                                "Count": 0,
+                                "Joint Top-1": "N/A (No Sample Data)",
+                                "Joint Top-5": "N/A"
+                            })
+                            continue
+
+                        matches = []
+                        for s in per_sample:
+                            attrs = s.get("attributes", {})
+                            match_all = True
+                            for t in sel_hist_tags:
+                                if ": " not in t: 
+                                    match_all = False; break
+                                tk, tv = t.split(": ", 1)
+                                if tk not in attrs:
+                                    match_all = False; break
+                                av = attrs[tk]
+                                if isinstance(av, list):
+                                    if tv not in av: match_all = False; break
+                                else:
+                                    if str(av) != tv: match_all = False; break
+                            
+                            if match_all: matches.append(s)
+                        
+                        if not matches:
+                             joint_results.append({
+                                "Run": run_name,
+                                "Count": 0,
+                                "Joint Top-1": "0.00%",
+                                "Joint Top-5": "0.00%"
+                            })
+                        else:
+                            cnt = len(matches)
+                            acc1 = sum([m["hit1"] for m in matches]) / cnt
+                            acc5 = sum([m["hit5"] for m in matches]) / cnt
+                             
+                            joint_results.append({
+                                "Run": run_name,
+                                "Count": cnt,
+                                "Joint Top-1": f"{acc1:.2%}",
+                                "Joint Top-5": f"{acc5:.2%}"
+                            })
+                    
+                    st.table(pd.DataFrame(joint_results))
 
             html_content += "</body></html>"
 
