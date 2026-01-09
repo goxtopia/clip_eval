@@ -123,22 +123,35 @@ def render_history_compare_tab():
                 colors = ["#F7D02C", "#FFFFFF", "#1E90FF"] # Yellow, White, DodgerBlue
                 cmap_delta = LinearSegmentedColormap.from_list("custom_delta", colors)
 
-                def get_matrix_map(data):
+                def get_matrix_map(data, cat_key):
                     """Extracts tags and Top-1 matrix from run data."""
-                    if "cross_results" in data:
-                        tags = data["cross_results"]["tags"]
-                        mat = np.array(data["cross_results"]["matrix_top1"], dtype=float)
-                        return tags, mat
+                    if "cross_results" not in data: return None, None
+                    cr = data["cross_results"]
+                    
+                    # New Structure
+                    if cat_key in cr and "tags" in cr[cat_key]:
+                        return cr[cat_key]["tags"], np.array(cr[cat_key]["matrix_top1"], dtype=float)
+                    
+                    # specific legacy fallback (old runs might have tags at root of cross_results, usually image tags)
+                    if cat_key == "img" and "tags" in cr:
+                        return cr["tags"], np.array(cr["matrix_top1"], dtype=float)
+
                     return None, None
 
-                base_tags, base_mat = get_matrix_map(baseline_data)
+                # Iterate for both Image and Text matrices
+                for cat in ["img", "txt"]:
+                    base_tags, base_mat = get_matrix_map(baseline_data, cat)
+                    if base_tags is None: continue
+                    
+                    section_title = "Image Tag Interaction" if cat == "img" else "Text Tag Interaction"
+                    st.markdown(f"#### {section_title} - Delta Heatmaps")
+                    html_content += f"<h3>{section_title}</h3>"
 
-                if base_tags is not None:
                     for d in comparison_data:
                         if d["filename"] == baseline_data["filename"]:
                             continue
 
-                        comp_tags, comp_mat = get_matrix_map(d)
+                        comp_tags, comp_mat = get_matrix_map(d, cat)
                         if comp_tags is None: continue
 
                         # Union of tags
@@ -180,19 +193,19 @@ def render_history_compare_tab():
                             vmin=-0.5, vmax=0.5,
                             ax=ax
                         )
-                        plt.title(f"Delta: {d['filename']} - Baseline ({baseline_data['filename']})")
+                        plt.title(f"Delta ({cat}): {d['filename']} - Baseline")
                         plt.xticks(rotation=45, ha="right")
 
                         ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
                         safe_name = d['filename'].replace(".json", "")
-                        delta_path = os.path.join(HISTORY_DIR, f"delta_{safe_name}_vs_base_{ts_str}.png")
+                        delta_path = os.path.join(HISTORY_DIR, f"delta_{cat}_{safe_name}_vs_base_{ts_str}.png")
                         plt.savefig(delta_path, bbox_inches="tight")
                         plt.close(fig)
 
-                        st.write(f"### Comparison: {d['filename']} vs Baseline")
+                        st.write(f"**{d['filename']}** vs Baseline")
                         st.image(delta_path)
 
-                        html_content += f"<h3>{d['filename']} vs Baseline</h3>"
+                        html_content += f"<h4>{d['filename']} vs Baseline</h4>"
                         html_content += f"<img src='{os.path.basename(delta_path)}' style='max-width:100%;'><br>"
 
             # --- Saved Queries Analysis (History) ---
