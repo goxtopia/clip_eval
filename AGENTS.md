@@ -9,7 +9,7 @@ This project is a CLIP Evaluation Tool designed to assess the performance of CLI
 -   **Data Loading:** Loads images and text labels from a specified directory. Uses a mapping JSON to link images to their ground truth text.
 -   **Filtering:** Allows users to filter the dataset based on pre-defined attributes (e.g., "Time: Day", "Person Size: Large") stored in a filter JSON file.
 -   **Metrics:** Calculates **Global Top-1 Accuracy** for Image-to-Text (I2T) retrieval.
--   **Matrix Analysis:** Breaks down accuracy by attribute values (e.g., accuracy for "Day" vs. "Night").
+-   **Matrix Analysis:** Breaks down accuracy by attribute values (e.g., accuracy for "Day" vs. "Night"). Includes a default "All" view and optional "Support (Count)" overlay.
 -   **History Saving:** Automatically saves every run's results to `history/run_{timestamp}.json`.
 -   **Note on T2I:** While the backend (`src/metrics.py`) contains logic for Text-to-Image (T2I) metrics, the current UI primarily exposes and runs Image-to-Text (I2T) evaluation.
 
@@ -23,13 +23,23 @@ This project is a CLIP Evaluation Tool designed to assess the performance of CLI
 -   **Optimization:** Resizes images to a maximum dimension of 1024px before sending to the VLM to reduce latency and cost.
 -   **Storage:** Attributes are stored keyed by the image's MD5 hash to avoid re-processing duplicates.
 
-### 3. History & Comparison (`app.py` - Tab 3)
--   **Comparison:** Allows users to select multiple past runs from the `history/` folder.
+### 3. History & Comparison (`app.py` - Tab 4)
+-   **Comparison:** Allows users to select multiple past runs from the `history/` folder and choose a **Baseline Run**.
 -   **Reporting:** Generates a unified HTML report containing:
     -   A summary table of runs (Model, Samples, Top-1 Acc, Active Filters).
     -   Detailed **Matrix Breakdown** tables comparing accuracy across attributes for each run.
+    -   **Comparison Heatmaps (Delta):** Visualizes the accuracy difference (Run - Baseline) for "All Tags" interactions.
+        -   **Yellow:** Negative difference (Regression).
+        -   **Blue:** Positive difference (Improvement).
     -   Downloadable HTML report.
 -   **Visualization:** Displays a simple bar chart of Global Top-1 accuracy for selected runs.
+
+### 4. Dataset Analysis (`app.py` - Tab 5)
+-   **Function:** Analyzes and visualizes the distribution of attributes/tags within the dataset.
+-   **Features:**
+    -   Loads the dataset and filter JSON.
+    -   Aggregates counts for every attribute key-value pair.
+    -   Displays frequency tables and bar charts for each attribute category (e.g., Person Size distribution, Time of Day distribution).
 
 ## Project Structure
 -   `app.py`: Main Streamlit entry point. Handles UI, evaluation orchestration, and reporting.
@@ -38,8 +48,14 @@ This project is a CLIP Evaluation Tool designed to assess the performance of CLI
 -   `src/model.py`: Wraps the CLIP model interactions (loading, encoding). Supports both `open_clip` and Hugging Face `transformers` backends. Includes caching and "Red vs Blue" sanity check.
 -   `src/metrics.py`: Computes I2T metrics (Top-1, Top-5, per-class).
 -   `history/`: Directory where evaluation results are saved.
+-   `tests/`: Unit tests for backend logic.
 
 ## How to Operate
+
+### Running Tests
+```bash
+python -m unittest discover tests
+```
 
 ### Running the App
 ```bash

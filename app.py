@@ -135,18 +135,36 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         return None, "No items match the selected tags."
 
     # Prepare logic
+    # In I2T: classes are unique texts.
+    # In T2I: queries are item texts (duplicates allowed to preserve attribute mapping).
     unique_texts = get_unique_texts(filtered_items)
+
+    if mode == "t2i":
+        # For T2I, we use the text of each item as a query.
+        queries = [item.representative_text for item in filtered_items]
+        # We need to filter out items with no text? DataLoader usually ensures this or empty string.
+        # But let's be safe.
+        valid_indices = [i for i, q in enumerate(queries) if q]
+        queries = [queries[i] for i in valid_indices]
+        # We might need to filter filtered_items too if we rely on index alignment!
+        # Actually, filtered_items contains the attributes we need.
+        # If an item has no text, it can't be a T2I query.
+        filtered_items = [filtered_items[i] for i in valid_indices]
+
+        target_texts = queries # For T2I, this list aligns with filtered_items
+    else:
+        target_texts = unique_texts # For I2T, we classify into unique labels
 
     # Load Model
     model = CLIPModel(model_name, None, pretrained_tag, device, "eval_cache.pt")
     model.load()
 
     # Encode
-    image_paths = [item.image_path for item in filtered_items]
+    image_paths = [item.image_path for item in filtered_items] # Search space for T2I, Input for I2T
     image_features = model.encode_images(image_paths, 32)
 
     templates = ["{}"]
-    text_features = model.encode_texts(unique_texts, 32, templates)
+    text_features = model.encode_texts(target_texts, 32, templates)
 
     image_features = image_features.to(device)
     text_features = text_features.to(device)
@@ -157,15 +175,8 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     bad_cases = {}
 
     # Store per-item (or per-query) hit status for matrix breakdown
-    # format: list of tuples (is_top1, is_top5) corresponding to 'filtered_items' or 'unique_texts'
+    # format: list of tuples (is_top1, is_top5) corresponding to 'filtered_items'
     performance_records = []
-
-    text_to_item_indices = {}
-    for idx, item in enumerate(filtered_items):
-        t = item.representative_text
-        if t:
-            if t not in text_to_item_indices: text_to_item_indices[t] = []
-            text_to_item_indices[t].append(idx)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     debug_dir = None
@@ -203,17 +214,43 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
             performance_records.append((hit1, hit5))
 
     else: # T2I
+        # text_features is [N_queries, D] (aligned with filtered_items)
+        # image_features is [N_items, D] (search space)
         sims_t2i = text_features @ image_features.T
         k = min(5, sims_t2i.size(1))
         _, top_idx = sims_t2i.topk(k=k, dim=-1)
         pred_images = top_idx.cpu()
 
         metrics, per_class, bad_cases = compute_t2i_metrics(
-            pred_images, gt_class_sets, unique_texts
+            pred_images, gt_class_sets, target_texts
         )
 
-        for stats in per_class:
-            performance_records.append((stats["top1"], stats["top5"]))
+        # In T2I now, queries align 1-to-1 with filtered_items.
+        # So we can just iterate the queries to get performance records.
+        # But compute_t2i_metrics aggregates per-class stats?
+        # No, wait. compute_t2i_metrics returns global metrics and per-class stats.
+        # We need per-QUERY hit status for the matrix.
+        # The function internal logic calculates this.
+        # I should have modified compute_t2i_metrics to return per-query status or recalculate it here.
+        # Since I didn't change the signature to return raw hits, I will recalculate quickly here.
+        # Or I can just trust the order?
+
+        # Let's recalculate simply here to be safe and avoid API changes.
+        query_norms = [normalize_label(t) for t in target_texts]
+
+        for i in range(len(target_texts)):
+            q_norm = query_norms[i]
+            preds_idx = pred_images[i].tolist()
+
+            is_relevant = []
+            for img_idx in preds_idx:
+                gset = gt_class_sets[img_idx]
+                rel = 1.0 if q_norm in gset else 0.0
+                is_relevant.append(rel)
+
+            hit1 = is_relevant[0]
+            hit5 = 1.0 if sum(is_relevant) > 0 else 0.0
+            performance_records.append((hit1, hit5))
 
     # Save Debug if enabled
     if debug_mode and bad_cases:
@@ -223,27 +260,15 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     sample_tags = []
     all_tags = set()
 
-    if mode == "i2t":
-        for item in filtered_items:
-            tags = set()
-            for k, v in item.attributes.items():
-                if k != 'filename':
-                    tag = f"{k}: {v}"
-                    tags.add(tag)
-                    all_tags.add(tag)
-            sample_tags.append(tags)
-    else:
-        for idx, text in enumerate(unique_texts):
-            origin_indices = text_to_item_indices.get(text, [])
-            tags = set()
-            for oid in origin_indices:
-                item = filtered_items[oid]
-                for k, v in item.attributes.items():
-                    if k != 'filename':
-                        tag = f"{k}: {v}"
-                        tags.add(tag)
-                        all_tags.add(tag)
-            sample_tags.append(tags)
+    # Now logic is identical for both modes because we aligned queries to items in T2I
+    for item in filtered_items:
+        tags = set()
+        for k, v in item.attributes.items():
+            if k != 'filename':
+                tag = f"{k}: {v}"
+                tags.add(tag)
+                all_tags.add(tag)
+        sample_tags.append(tags)
 
     sorted_tags = sorted(list(all_tags))
 
@@ -256,6 +281,15 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         tags_list = list(tags)
         for t1 in tags_list:
             for t2 in tags_list:
+                # NEW LOGIC START: Prevent mutually exclusive tag intersections
+                # If tags have format "Key: Value" and share same Key but diff Value, skip.
+                if ": " in t1 and ": " in t2:
+                    k1, v1 = t1.split(": ", 1)
+                    k2, v2 = t2.split(": ", 1)
+                    if k1 == k2 and v1 != v2:
+                        continue
+                # NEW LOGIC END
+
                 key = (t1, t2)
                 if key not in cross_matrix_data:
                     cross_matrix_data[key] = {"sum1": 0.0, "sum5": 0.0, "count": 0}
@@ -334,9 +368,10 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     results = {
         "metrics": metrics,
         "cross_results": cross_results,
-        "n_samples": len(filtered_items) if mode == "i2t" else len(unique_texts),
+        "n_samples": len(filtered_items),
         "timestamp": timestamp,
         "model": model_name,
+        "pretrained": pretrained,
         "filters": selected_filters,
         "mode": mode,
         "debug_dir": debug_dir
@@ -346,7 +381,9 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
 
 def save_run(results):
     ts = results["timestamp"]
-    fname = f"run_{ts}.json"
+    model = results.get("model", "unknown").replace("/", "_").replace(" ", "_")
+    tag = results.get("pretrained", "unknown").replace("/", "_").replace(" ", "_")
+    fname = f"run_{model}_{tag}_{ts}.json"
     path = os.path.join(HISTORY_DIR, fname)
     with open(path, "w") as f:
         # We need to handle np.nan for JSON dump
@@ -368,7 +405,7 @@ def save_run(results):
     return path
 
 # --- Tabs ---
-tab1, tab2, tab3, tab4 = st.tabs(["Run Evaluation", "Debug View", "Auto-labeling", "History & Compare"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Run Evaluation", "Debug View", "Auto-labeling", "History & Compare", "Dataset Analysis"])
 
 with tab1:
     st.header("Run Evaluation")
@@ -390,6 +427,8 @@ with tab1:
             eval_mode = st.selectbox("Evaluation Mode", ["i2t", "t2i"])
         with c2:
             enable_debug = st.checkbox("Enable Debug Mode (Save Bad Cases)")
+        with c3:
+            show_support = st.checkbox("Show Support (Count)")
 
         # Extract available filter options
         filter_options = {}
@@ -460,11 +499,14 @@ with tab1:
                 m1_arr = to_float_array(m1)
                 m5_arr = to_float_array(m5)
 
+                counts_arr = np.array(cross.get("matrix_counts", []))
+
                 # Iterate over groups to create sub-matrices
                 # If no groups found (no ": " in tags), fallback to full matrix?
                 # The prompt implies structured tags. If simple tags, maybe just one group.
                 
-                groups_to_plot = list(tag_groups.keys()) if tag_groups else ["All"]
+                # Ensure "All" is always present and first
+                groups_to_plot = ["All"] + sorted(list(tag_groups.keys()))
                 
                 for grp in groups_to_plot:
                     print(f"Processing group: {grp}")
@@ -493,7 +535,37 @@ with tab1:
                     # numpy advanced indexing
                     sub_m1 = m1_arr[np.ix_(row_indices, col_indices)]
                     sub_m5 = m5_arr[np.ix_(row_indices, col_indices)]
+                    sub_counts = counts_arr[np.ix_(row_indices, col_indices)]
                     
+                    # Prepare annotations
+                    if show_support:
+                        # Create annotation matrix
+                        annot_m1 = np.empty(sub_m1.shape, dtype=object)
+                        annot_m5 = np.empty(sub_m5.shape, dtype=object)
+                        for r in range(sub_m1.shape[0]):
+                            for c in range(sub_m1.shape[1]):
+                                count = int(sub_counts[r, c])
+                                val1 = sub_m1[r, c]
+                                val5 = sub_m5[r, c]
+
+                                if np.isnan(val1):
+                                    annot_m1[r, c] = ""
+                                else:
+                                    annot_m1[r, c] = f"{val1:.1%}\n({count})"
+
+                                if np.isnan(val5):
+                                    annot_m5[r, c] = ""
+                                else:
+                                    annot_m5[r, c] = f"{val5:.1%}\n({count})"
+
+                        annot1 = annot_m1
+                        annot5 = annot_m5
+                        fmt = "" # format is handled in annot strings
+                    else:
+                        annot1 = True
+                        annot5 = True
+                        fmt = ".1%"
+
                     # Create Tabs for this group
                     mtab1, mtab2 = st.tabs([f"{grp} Top-1", f"{grp} Top-5"])
                     
@@ -501,8 +573,8 @@ with tab1:
                     fig1, ax1 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
                     sns.heatmap(
                         sub_m1,
-                        annot=True,
-                        fmt=".1%",
+                        annot=annot1,
+                        fmt=fmt,
                         xticklabels=sub_tags_col,
                         yticklabels=sub_tags_row,
                         cmap="Blues",
@@ -520,8 +592,8 @@ with tab1:
                     fig2, ax2 = plt.subplots(figsize=(10, len(sub_tags_row)*0.5 + 2))
                     sns.heatmap(
                         sub_m5,
-                        annot=True,
-                        fmt=".1%",
+                        annot=annot5,
+                        fmt=fmt,
                         xticklabels=sub_tags_col,
                         yticklabels=sub_tags_row,
                         cmap="Blues",
@@ -608,12 +680,49 @@ with tab3:
                 st.error("Auto-labeling failed.")
                 st.text_area("Error", stderr)
 
+with tab5:
+    st.header("Dataset Analysis")
+    st.write("Analyze the distribution of tags in your dataset.")
+
+    if st.button("Load & Analyze Dataset", key="btn_analyze"):
+         if not os.path.exists(dataset_dir):
+            st.error("Dataset directory not found.")
+         else:
+            items = load_data(dataset_dir, mapping_path, filter_json_path)
+            st.success(f"Loaded {len(items)} items.")
+
+            # Aggregate Tags
+            tag_counts = {}
+            for item in items:
+                for k, v in item.attributes.items():
+                    if k == 'filename': continue
+                    if k not in tag_counts: tag_counts[k] = {}
+                    if v not in tag_counts[k]: tag_counts[k][v] = 0
+                    tag_counts[k][v] += 1
+
+            # Display
+            if not tag_counts:
+                st.warning("No tags found. Run Auto-labeling first.")
+            else:
+                for cat in sorted(tag_counts.keys()):
+                    st.subheader(f"Attribute: {cat}")
+                    data = tag_counts[cat]
+                    df = pd.DataFrame(list(data.items()), columns=["Value", "Count"])
+                    df = df.sort_values(by="Count", ascending=False)
+
+                    c1, c2 = st.columns([1, 2])
+                    with c1:
+                        st.dataframe(df, hide_index=True)
+                    with c2:
+                        st.bar_chart(df.set_index("Value"))
+
 with tab4:
     st.header("History & Compare")
 
     history_files = sorted([f for f in os.listdir(HISTORY_DIR) if f.endswith(".json")], reverse=True)
 
     selected_runs = st.multiselect("Select runs to compare", history_files)
+    baseline_run = st.selectbox("Select Baseline Run", selected_runs) if selected_runs else None
 
     if st.button("Generate Comparison Report"):
         if not selected_runs:
@@ -621,11 +730,15 @@ with tab4:
         else:
             # Aggregate data
             comparison_data = []
+            baseline_data = None
+
             for fname in selected_runs:
                 with open(os.path.join(HISTORY_DIR, fname)) as f:
                     data = json.load(f)
                     data["filename"] = fname
                     comparison_data.append(data)
+                    if fname == baseline_run:
+                        baseline_data = data
 
             # Create HTML
             html_content = "<html><head><title>Comparison Report</title>"
@@ -711,6 +824,87 @@ with tab4:
                         html_content += "<td>N/A</td>"
                 html_content += "</tr>"
             html_content += "</table>"
+
+            # --- Comparison Heatmap (Delta) ---
+            if baseline_data and len(comparison_data) > 1:
+                html_content += "<h2>Comparison Heatmaps (Delta: Comparison - Baseline)</h2>"
+
+                # Custom Colormap: Yellow (Neg) -> White (0) -> Blue (Pos)
+                from matplotlib.colors import LinearSegmentedColormap
+                colors = ["#F7D02C", "#FFFFFF", "#1E90FF"] # Yellow, White, DodgerBlue
+                cmap_delta = LinearSegmentedColormap.from_list("custom_delta", colors)
+
+                def get_matrix_map(data):
+                    """Extracts tags and Top-1 matrix from run data."""
+                    if "cross_results" in data:
+                        tags = data["cross_results"]["tags"]
+                        mat = np.array(data["cross_results"]["matrix_top1"], dtype=float)
+                        return tags, mat
+                    return None, None
+
+                base_tags, base_mat = get_matrix_map(baseline_data)
+
+                if base_tags is not None:
+                    for d in comparison_data:
+                        if d["filename"] == baseline_data["filename"]:
+                            continue
+
+                        comp_tags, comp_mat = get_matrix_map(d)
+                        if comp_tags is None: continue
+
+                        # Union of tags
+                        all_comparison_tags = sorted(list(set(base_tags) | set(comp_tags)))
+
+                        # Reconstruct aligned matrices
+                        def align_matrix(tags, mat, all_tags):
+                            size = len(all_tags)
+                            aligned = np.full((size, size), np.nan)
+
+                            # Create mapping from old idx to new idx
+                            old_to_new = {}
+                            for i, t in enumerate(tags):
+                                if t in all_tags:
+                                    old_to_new[i] = all_tags.index(t)
+
+                            for r in range(mat.shape[0]):
+                                for c in range(mat.shape[1]):
+                                    if r in old_to_new and c in old_to_new:
+                                        aligned[old_to_new[r], old_to_new[c]] = mat[r, c]
+                            return aligned
+
+                        m_base_aligned = align_matrix(base_tags, base_mat, all_comparison_tags)
+                        m_comp_aligned = align_matrix(comp_tags, comp_mat, all_comparison_tags)
+
+                        # Compute Delta
+                        delta_mat = m_comp_aligned - m_base_aligned
+
+                        # Plot
+                        fig, ax = plt.subplots(figsize=(10, len(all_comparison_tags)*0.5 + 2))
+                        sns.heatmap(
+                            delta_mat,
+                            annot=True,
+                            fmt=".1%",
+                            xticklabels=all_comparison_tags,
+                            yticklabels=all_comparison_tags,
+                            cmap=cmap_delta,
+                            center=0,
+                            vmin=-0.5, vmax=0.5, # Fixed range for consistency or auto? let's constrain a bit
+                            ax=ax
+                        )
+                        plt.title(f"Delta: {d['filename']} - Baseline ({baseline_data['filename']})")
+                        plt.xticks(rotation=45, ha="right")
+
+                        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        safe_name = d['filename'].replace(".json", "")
+                        delta_path = os.path.join(HISTORY_DIR, f"delta_{safe_name}_vs_base_{ts_str}.png")
+                        plt.savefig(delta_path, bbox_inches="tight")
+                        plt.close(fig)
+
+                        st.write(f"### Comparison: {d['filename']} vs Baseline")
+                        st.image(delta_path)
+
+                        html_content += f"<h3>{d['filename']} vs Baseline</h3>"
+                        html_content += f"<img src='{os.path.basename(delta_path)}' style='max-width:100%;'><br>"
 
             html_content += "</body></html>"
 
