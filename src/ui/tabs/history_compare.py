@@ -124,43 +124,67 @@ def render_history_compare_tab():
                 cmap_delta = LinearSegmentedColormap.from_list("custom_delta", colors)
 
                 def get_matrix_map(data, cat_key):
-                    """Extracts tags and Top-1 matrix from run data."""
-                    if "cross_results" not in data: return None, None
+                    """Extracts tags, Top-1, Top-5, and Count matrices."""
+                    if "cross_results" not in data: return None, None, None, None
                     cr = data["cross_results"]
                     
                     # New Structure
                     if cat_key in cr and "tags" in cr[cat_key]:
-                        return cr[cat_key]["tags"], np.array(cr[cat_key]["matrix_top1"], dtype=float)
+                        d = cr[cat_key]
+                        return (
+                            d["tags"], 
+                            np.array(d["matrix_top1"], dtype=float),
+                            np.array(d["matrix_top5"], dtype=float),
+                            np.array(d["matrix_count"], dtype=int)
+                        )
                     
-                    # specific legacy fallback (old runs might have tags at root of cross_results, usually image tags)
+                    # Legacy fallback
                     if cat_key == "img" and "tags" in cr:
-                        return cr["tags"], np.array(cr["matrix_top1"], dtype=float)
+                        return (
+                            cr["tags"], 
+                            np.array(cr["matrix_top1"], dtype=float),
+                            np.array(cr.get("matrix_top5", cr["matrix_top1"]), dtype=float), # fallback if missing
+                            np.array(cr.get("matrix_count", []), dtype=int) if "matrix_count" in cr else None 
+                        )
 
-                    return None, None
+                    return None, None, None, None
+
+                # UI Controls for Heatmap
+                hm_metric = st.radio("Heatmap Metric", ["Top-1 Accuracy", "Top-5 Accuracy"], horizontal=True)
+                show_support = st.checkbox("Show Support (Count) in Heatmap", value=True)
 
                 # Iterate for both Image and Text matrices
                 for cat in ["img", "txt"]:
-                    base_tags, base_mat = get_matrix_map(baseline_data, cat)
+                    base_tags, base_m1, base_m5, base_cnt = get_matrix_map(baseline_data, cat)
                     if base_tags is None: continue
                     
+                    # Select Base Metric
+                    base_mat = base_m5 if hm_metric == "Top-5 Accuracy" else base_m1
+
                     section_title = "Image Tag Interaction" if cat == "img" else "Text Tag Interaction"
                     st.markdown(f"#### {section_title} - Delta Heatmaps")
-                    html_content += f"<h3>{section_title}</h3>"
+                    html_content += f"<h3>{section_title} ({hm_metric})</h3>"
 
                     for d in comparison_data:
                         if d["filename"] == baseline_data["filename"]:
                             continue
 
-                        comp_tags, comp_mat = get_matrix_map(d, cat)
+                        comp_tags, comp_m1, comp_m5, comp_cnt = get_matrix_map(d, cat)
                         if comp_tags is None: continue
+
+                        # Select Comp Metric
+                        comp_mat = comp_m5 if hm_metric == "Top-5 Accuracy" else comp_m1
 
                         # Union of tags
                         all_comparison_tags = sorted(list(set(base_tags) | set(comp_tags)))
 
                         # Reconstruct aligned matrices
-                        def align_matrix(tags, mat, all_tags):
+                        def align_matrix(tags, mat, all_tags, fill_val=np.nan):
                             size = len(all_tags)
-                            aligned = np.full((size, size), np.nan)
+                            aligned = np.full((size, size), fill_val)
+                            
+                            # If source matrix is None (legacy case), return NaNs
+                            if mat is None: return aligned
 
                             # Create mapping from old idx to new idx
                             old_to_new = {}
@@ -171,34 +195,58 @@ def render_history_compare_tab():
                             for r in range(mat.shape[0]):
                                 for c in range(mat.shape[1]):
                                     if r in old_to_new and c in old_to_new:
-                                        aligned[old_to_new[r], old_to_new[c]] = mat[r, c]
+                                        # boundary check
+                                        if r < mat.shape[0] and c < mat.shape[1]:
+                                            aligned[old_to_new[r], old_to_new[c]] = mat[r, c]
                             return aligned
 
                         m_base_aligned = align_matrix(base_tags, base_mat, all_comparison_tags)
                         m_comp_aligned = align_matrix(comp_tags, comp_mat, all_comparison_tags)
+                        
+                        # Align counts for annotation
+                        cnt_aligned = align_matrix(comp_tags, comp_cnt, all_comparison_tags, fill_val=0)
 
                         # Compute Delta
                         delta_mat = m_comp_aligned - m_base_aligned
+
+                        # Prepare Annotations
+                        annot_labels = []
+                        for r in range(len(all_comparison_tags)):
+                            row_labels = []
+                            for c in range(len(all_comparison_tags)):
+                                val = delta_mat[r, c]
+                                if np.isnan(val):
+                                    row_labels.append("")
+                                else:
+                                    lbl = f"{val:+.1%}"
+                                    if show_support:
+                                        count = int(cnt_aligned[r, c])
+                                        lbl += f"\n({count})"
+                                    row_labels.append(lbl)
+                            annot_labels.append(row_labels)
+                        annot_labels = np.array(annot_labels)
+
 
                         # Plot
                         fig, ax = plt.subplots(figsize=(10, len(all_comparison_tags)*0.5 + 2))
                         sns.heatmap(
                             delta_mat,
-                            annot=True,
-                            fmt=".1%",
+                            annot=annot_labels,
+                            fmt="",
                             xticklabels=all_comparison_tags,
                             yticklabels=all_comparison_tags,
                             cmap=cmap_delta,
                             center=0,
-                            vmin=-0.5, vmax=0.5,
+                            vmin=-0.2, vmax=0.2, # Adjust range for better visibility
                             ax=ax
                         )
-                        plt.title(f"Delta ({cat}): {d['filename']} - Baseline")
+                        metric_short = "Top5" if hm_metric == "Top-5 Accuracy" else "Top1"
+                        plt.title(f"Delta {metric_short} ({cat}): {d['filename']} - Baseline")
                         plt.xticks(rotation=45, ha="right")
 
                         ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
                         safe_name = d['filename'].replace(".json", "")
-                        delta_path = os.path.join(HISTORY_DIR, f"delta_{cat}_{safe_name}_vs_base_{ts_str}.png")
+                        delta_path = os.path.join(HISTORY_DIR, f"delta_{cat}_{metric_short}_{safe_name}_vs_base_{ts_str}.png")
                         plt.savefig(delta_path, bbox_inches="tight")
                         plt.close(fig)
 
@@ -212,7 +260,40 @@ def render_history_compare_tab():
             st.divider()
             st.subheader("Saved Queries Analysis")
             
-            from src.analysis_config import load_queries
+            from src.analysis_config import load_queries, save_queries
+
+            # Add New Query UI (History Context)
+            with st.expander("Add New Query", expanded=False):
+                # Reuse all_tags_report collected earlier for consistency
+                sorted_avail_history = sorted(list(all_tags_report))
+                
+                # Load existing for name checking
+                if "saved_queries" not in st.session_state:
+                     st.session_state["saved_queries"] = load_queries()
+                current_saved = st.session_state["saved_queries"]
+
+                c1, c2, c3 = st.columns([2, 2, 1])
+                with c1:
+                    new_tags = st.multiselect("Select Tags", sorted_avail_history, key="hist_new_query_tags")
+                with c2:
+                    default_name = f"Query {len(current_saved)+1}"
+                    new_name = st.text_input("Query Name", value=default_name, key="hist_new_query_name")
+                with c3:
+                    st.write("") 
+                    st.write("") 
+                    if st.button("Add Query", key="hist_add_query_btn"):
+                        if not new_tags:
+                            st.warning("Select tags first.")
+                        else:
+                            if any(q['name'] == new_name for q in current_saved):
+                                st.warning("Query name already exists.")
+                            else:
+                                current_saved.append({"name": new_name, "tags": new_tags})
+                                save_queries(current_saved)
+                                st.session_state["saved_queries"] = current_saved
+                                st.success(f"Added '{new_name}'")
+                                st.rerun()
+
             saved_queries = load_queries()
 
             if not saved_queries:
