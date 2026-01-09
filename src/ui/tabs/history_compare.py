@@ -218,7 +218,7 @@ def render_history_compare_tab():
             if not saved_queries:
                 st.info("No saved queries found. Create them in 'Run Evaluation' tab.")
             else:
-                st.write("Comparing saved queries across selected runs. (Metric: Top-1 Drop-down to count/Top-5)")
+                st.write("Comparing saved queries across selected runs. (Metric: Top-1 (Delta) / Top-5 (Delta) (Count))")
 
                 # We want a table: Rows = Queries, Columns = Runs
                 # Or Rows = Runs, Columns = Queries? Rows=Queries seems better for "Feature X performance across models"
@@ -231,12 +231,16 @@ def render_history_compare_tab():
                     
                     row = {"Query": q_name, "Tags": ", ".join(sorted(q_tags))}
 
+                    # First pass: Collect stats for all runs for this query
+                    query_stats = {} # run_name -> (acc1, acc5, cnt)
+                    
                     for d in comparison_data:
                         run_name = d["filename"]
                         per_sample = d.get("per_sample_results", [])
                         
                         cnt = 0
                         acc1 = 0.0
+                        acc5 = 0.0
                         
                         if per_sample:
                             matches = []
@@ -260,9 +264,32 @@ def render_history_compare_tab():
                             if matches:
                                 cnt = len(matches)
                                 acc1 = sum([m["hit1"] for m in matches]) / cnt
+                                acc5 = sum([m["hit5"] for m in matches]) / cnt
                         
-                        # Format: "85.2% (120)"
-                        row[run_name] = f"{acc1:.1%} ({cnt})"
+                        query_stats[run_name] = (acc1, acc5, cnt)
+
+                    # Get Baseline Stats
+                    base_stats = query_stats.get(baseline_run)
+
+                    # Second pass: Format Output
+                    for d in comparison_data:
+                        run_name = d["filename"]
+                        acc1, acc5, cnt = query_stats[run_name]
+                        
+                        # Base Format: "85.2% / 92.0% (120)"
+                        val_str = f"{acc1:.1%} / {acc5:.1%} ({cnt})"
+
+                        # Add Delta if baseline exists and this is not baseline
+                        if base_stats and run_name != baseline_run:
+                            base_acc1, base_acc5, base_cnt = base_stats
+                            # Only show delta if baseline has samples? 
+                            if base_cnt > 0:
+                                d1 = acc1 - base_acc1
+                                d5 = acc5 - base_acc5
+                                # Enhanced Format: "85.2% (+2.1%) / 92.0% (-1.0%) (120)"
+                                val_str = f"{acc1:.1%} ({d1:+.1%}) / {acc5:.1%} ({d5:+.1%}) ({cnt})"
+                        
+                        row[run_name] = val_str
 
                     table_data.append(row)
 
