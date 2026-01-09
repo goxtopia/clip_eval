@@ -48,8 +48,14 @@ This project is a CLIP Evaluation Tool designed to assess the performance of CLI
 -   `src/model.py`: Wraps the CLIP model interactions (loading, encoding). Supports both `open_clip` and Hugging Face `transformers` backends. Includes caching and "Red vs Blue" sanity check.
 -   `src/metrics.py`: Computes I2T metrics (Top-1, Top-5, per-class).
 -   `history/`: Directory where evaluation results are saved.
+-   `tests/`: Unit tests for backend logic.
 
 ## How to Operate
+
+### Running Tests
+```bash
+python -m unittest discover tests
+```
 
 ### Running the App
 ```bash
