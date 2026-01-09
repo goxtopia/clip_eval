@@ -27,7 +27,7 @@ with tab3:
     render_auto_labeling_tab(config)
 
 with tab4:
-    render_history_compare_tab()
+    render_history_compare_tab(config)
 
 with tab5:
     render_dataset_analysis_tab(config)

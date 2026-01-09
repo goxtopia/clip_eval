@@ -6,10 +6,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
+from src.app_utils import load_data
 
 HISTORY_DIR = "history"
 
-def render_history_compare_tab():
+def render_history_compare_tab(config):
     st.header("History & Compare")
 
     if not os.path.exists(HISTORY_DIR):
@@ -25,6 +26,8 @@ def render_history_compare_tab():
             st.warning("Select at least one run.")
         else:
             st.session_state["history_report_active"] = True
+
+
 
     if st.session_state.get("history_report_active", False):
         # Ensure we still have runs selected, otherwise warn/reset
@@ -290,12 +293,41 @@ def render_history_compare_tab():
             st.subheader("Saved Queries Analysis")
             
             from src.analysis_config import load_queries, save_queries
+            from src.app_utils import load_data
 
             # Add New Query UI (History Context)
             with st.expander("Add New Query", expanded=False):
                 # Reuse all_tags_report collected earlier for consistency
-                sorted_avail_history = sorted(list(all_tags_report))
+                # Also try to load tags from Config/Items to ensure complete list if available
+                all_avail_tags = set(all_tags_report)
                 
+                # Try to get items from session state or load them
+                items = st.session_state.get("items")
+                if not items and config:
+                    # Attempt to load if config is valid
+                    try:
+                        if os.path.exists(config.get("dataset_dir", "")):
+                            items = load_data(
+                                config["dataset_dir"], 
+                                config["mapping_path"], 
+                                config["filter_json_path"], 
+                                config["text_json_path"]
+                            )
+                    except Exception:
+                        pass # Ignore loading errors here
+                
+                if items:
+                     for item in items:
+                        for k, v in item.attributes.items():
+                             vals = v if isinstance(v, list) else [v]
+                             for val in vals:
+                                 all_avail_tags.add(f"{k}: {val}")
+
+                sorted_avail_history = sorted(list(all_avail_tags))
+                
+                if not sorted_avail_history:
+                    st.warning("No tags available. Please load data in 'Run Evaluation' or select runs with tags.")
+
                 # Load existing for name checking
                 if "saved_queries" not in st.session_state:
                      st.session_state["saved_queries"] = load_queries()
