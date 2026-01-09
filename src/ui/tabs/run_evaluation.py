@@ -203,11 +203,11 @@ def render_results(res, show_support):
 
                 results_data.append({
                      "Name": q_name,
-                     "Tags": ", ".join(q_tags),
+                     "Tags": ", ".join(sorted(q_tags)),
                      "Count": cnt,
                      "Top-1": f"{acc1:.2%}",
                      "Top-5": f"{acc5:.2%}",
-                     "Missing Tags": ", ".join(missing_tags) if missing_tags else ""
+                     "Missing Tags": ", ".join(sorted(missing_tags)) if missing_tags else ""
                 })
 
             df_res = pd.DataFrame(results_data)

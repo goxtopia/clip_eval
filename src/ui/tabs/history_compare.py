@@ -216,7 +216,7 @@ def render_history_compare_tab():
                     q_name = q["name"]
                     q_tags = q["tags"]
                     
-                    row = {"Query": q_name, "Tags": ", ".join(q_tags)}
+                    row = {"Query": q_name, "Tags": ", ".join(sorted(q_tags))}
 
                     for d in comparison_data:
                         run_name = d["filename"]
