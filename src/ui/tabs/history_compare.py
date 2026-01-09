@@ -299,7 +299,8 @@ def render_history_compare_tab(config):
             with st.expander("Add New Query", expanded=False):
                 # Reuse all_tags_report collected earlier for consistency
                 # Also try to load tags from Config/Items to ensure complete list if available
-                all_avail_tags = set(all_tags_report)
+                # keys might be just k or "k: v", usually "k: v" in report
+                all_avail_tags = {t for t in all_tags_report if not t.startswith("filename: ")}
                 
                 # Try to get items from session state or load them
                 items = st.session_state.get("items")
@@ -319,6 +320,7 @@ def render_history_compare_tab(config):
                 if items:
                      for item in items:
                         for k, v in item.attributes.items():
+                             if k == 'filename': continue
                              vals = v if isinstance(v, list) else [v]
                              for val in vals:
                                  all_avail_tags.add(f"{k}: {val}")
