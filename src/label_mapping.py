@@ -6,6 +6,8 @@ class LabelMapper:
     def __init__(self, mapping_path: str):
         self.equivalents: List[Set[str]] = []
         self.implications: Dict[str, Set[str]] = {}
+        self.equivalent_map = {}
+        self.closure = {}
         
         if os.path.exists(mapping_path):
             self._load_mapping(mapping_path)

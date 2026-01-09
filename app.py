@@ -256,6 +256,15 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         tags_list = list(tags)
         for t1 in tags_list:
             for t2 in tags_list:
+                # NEW LOGIC START: Prevent mutually exclusive tag intersections
+                # If tags have format "Key: Value" and share same Key but diff Value, skip.
+                if ": " in t1 and ": " in t2:
+                    k1, v1 = t1.split(": ", 1)
+                    k2, v2 = t2.split(": ", 1)
+                    if k1 == k2 and v1 != v2:
+                        continue
+                # NEW LOGIC END
+
                 key = (t1, t2)
                 if key not in cross_matrix_data:
                     cross_matrix_data[key] = {"sum1": 0.0, "sum5": 0.0, "count": 0}
