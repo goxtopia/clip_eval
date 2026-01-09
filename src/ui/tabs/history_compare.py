@@ -24,6 +24,14 @@ def render_history_compare_tab():
         if not selected_runs:
             st.warning("Select at least one run.")
         else:
+            st.session_state["history_report_active"] = True
+
+    if st.session_state.get("history_report_active", False):
+        # Ensure we still have runs selected, otherwise warn/reset
+        if not selected_runs:
+             st.warning("No runs selected. Please select runs above.")
+             st.session_state["history_report_active"] = False
+        else:
             # Aggregate data
             comparison_data = []
             baseline_data = None
