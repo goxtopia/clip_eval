@@ -32,8 +32,9 @@ st.sidebar.title("Configuration")
 dataset_dir = st.sidebar.text_input("Dataset Directory", "data")
 model_name = st.sidebar.text_input("Model Name/ID", "MobileCLIP-S2")
 pretrained_tag = st.sidebar.text_input("Pretrained Tag", "openai")
-filter_json_path = st.sidebar.text_input("Tag JSON Path", "filter_attributes.json")
-mapping_path = st.sidebar.text_input("Mapping JSON Path", "mapping.json")
+filter_json_path = st.sidebar.text_input("Image Tag JSON", "filter_attributes.json")
+text_attributes_path = st.sidebar.text_input("Text Tag JSON", "text_attributes.json")
+mapping_path = st.sidebar.text_input("Mapping JSON", "mapping.json")
 
 st.sidebar.markdown("### Auto-labeling Config")
 api_url = st.sidebar.text_input("API URL", "http://localhost:8000/v1")
@@ -43,9 +44,9 @@ vlm_model = st.sidebar.text_input("VLM Model Name", "gpt-4o-mini")
 # --- Functions ---
 
 @st.cache_data
-def load_data(data_dir, mapping, filter_path):
+def load_data(data_dir, mapping, filter_path, text_attr_path):
     mapper = LabelMapper(mapping)
-    loader = DataLoader(data_dir, mapper, filter_json_path=filter_path)
+    loader = DataLoader(data_dir, mapper, filter_json_path=filter_path, text_attributes_path=text_attr_path)
     return loader.load()
 
 def save_debug_cases(items, bad_cases, mode, timestamp):
@@ -256,6 +257,18 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
     if debug_mode and bad_cases:
         debug_dir = save_debug_cases(filtered_items, bad_cases, mode, timestamp)
 
+    # --- Prepare sample results for history (per-sample metadata) ---
+    # We save (id, hit1, hit5) for historical analysis
+    sample_results = []
+    for i, item in enumerate(filtered_items):
+        hit1, hit5 = performance_records[i]
+        sample_results.append({
+            "md5": item.md5,
+            "filename": os.path.basename(item.image_path),
+            "hit1": hit1,
+            "hit5": hit5
+        })
+
     # --- Cross-Attribute Matrix Calculation ---
     sample_tags = []
     all_tags = set()
@@ -374,7 +387,8 @@ def run_evaluation(items, model_name, pretrained, device, selected_filters, mode
         "pretrained": pretrained,
         "filters": selected_filters,
         "mode": mode,
-        "debug_dir": debug_dir
+        "debug_dir": debug_dir,
+        "sample_results": sample_results # Added for advanced comparison
     }
 
     return results, None
@@ -414,7 +428,7 @@ with tab1:
         if not os.path.exists(dataset_dir):
             st.error("Dataset directory not found.")
         else:
-            items = load_data(dataset_dir, mapping_path, filter_json_path)
+            items = load_data(dataset_dir, mapping_path, filter_json_path, text_attributes_path)
             st.session_state["items"] = items
             st.success(f"Loaded {len(items)} items.")
 
@@ -440,11 +454,48 @@ with tab1:
         # Display Filters
         st.subheader("Tags")
         selected_filters = {}
-        cols = st.columns(len(filter_options) if filter_options else 1)
-        for i, (k, vals) in enumerate(filter_options.items()):
-            with cols[i % len(cols)]:
+        cols = st.columns(3)
+
+        # Sort keys to make UI consistent
+        sorted_keys = sorted(list(filter_options.keys()))
+        for i, k in enumerate(sorted_keys):
+            vals = filter_options[k]
+            with cols[i % 3]:
                 selected_vals = st.multiselect(f"Tag by {k}", sorted(list(vals)))
                 selected_filters[k] = selected_vals
+
+        # --- Joint Tag Calculator (Custom Query) ---
+        st.markdown("### Joint Tag Calculator")
+        st.write("Calculate accuracy for samples satisfying ALL selected conditions.")
+
+        # We need a unified list of "Key: Value" options
+        all_tag_options = []
+        for k, vals in filter_options.items():
+            for v in vals:
+                all_tag_options.append(f"{k}: {v}")
+        all_tag_options.sort()
+
+        joint_selection = st.multiselect("Select Tags for Joint Calculation", all_tag_options)
+
+        if st.button("Compute Joint Accuracy"):
+            # Identify samples
+            joint_matches = []
+
+            # Parse selection into dict
+            query_dict = {}
+            for t in joint_selection:
+                k, v = t.split(": ", 1)
+                if k not in query_dict: query_dict[k] = []
+                query_dict[k].append(v)
+
+            # Filter current loaded items?
+            # Ideally we should run this AFTER evaluation on the results?
+            # Or can we compute it if we have results?
+            # We only have results after "Run Evaluation".
+            pass # We handle this inside "Run Evaluation" logic or separate button if results exist.
+
+        # Move Joint Calc to Results section to use `performance_records` logic?
+        # Yes, better to put it below results if results exist.
 
         if st.button("Run Evaluation"):
             with st.spinner(f"Running {eval_mode.upper()} evaluation..."):
@@ -468,6 +519,56 @@ with tab1:
             c1, c2 = st.columns(2)
             c1.metric("Global Top-1", f"{m['global_top1']*100:.2f}%")
             c2.metric("Global Top-5", f"{m['global_top5']*100:.2f}%")
+
+            # --- Joint Tag Calculator Results ---
+            if joint_selection:
+                st.subheader("Joint Calculation Results")
+                # We need to re-find the indices that match the joint selection
+                # But `res` contains `sample_results` which has md5/filename/hit info.
+                # `items` (session_state) corresponds to `sample_results`?
+                # Yes, if items haven't changed.
+                # Let's verify via metadata or just index.
+                # `res['sample_results']` is aligned with `filtered_items` used in evaluation.
+                # `items` in session_state is ALL items.
+                # Wait, `run_evaluation` filters items.
+                # We need to map `sample_results` back to attributes.
+                # `sample_results` has MD5. We can look up attributes in `items` via MD5.
+
+                # Build lookup for items by MD5
+                item_lookup = {item.md5: item for item in items}
+
+                # Filter results
+                joint_hits1 = []
+                joint_hits5 = []
+                count = 0
+
+                for s_res in res["sample_results"]:
+                    md5 = s_res["md5"]
+                    item = item_lookup.get(md5)
+                    if not item: continue
+
+                    # Check match
+                    match = True
+                    for req_tag in joint_selection:
+                        k, v = req_tag.split(": ", 1)
+                        if item.attributes.get(k) != v:
+                            match = False
+                            break
+
+                    if match:
+                        joint_hits1.append(s_res["hit1"])
+                        joint_hits5.append(s_res["hit5"])
+                        count += 1
+
+                if count > 0:
+                    j_acc1 = sum(joint_hits1) / count
+                    j_acc5 = sum(joint_hits5) / count
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Joint Acc@1", f"{j_acc1:.2%}")
+                    c2.metric("Joint Acc@5", f"{j_acc5:.2%}")
+                    c3.metric("Samples", count)
+                else:
+                    st.warning("No samples found matching Joint Selection.")
 
             # --- Tag Performance Table ---
             cross = res.get("cross_results", {})
@@ -680,6 +781,28 @@ with tab3:
                 st.error("Auto-labeling failed.")
                 st.text_area("Error", stderr)
 
+    st.divider()
+    st.subheader("Text Auto-labeling")
+    st.write("Extract attributes from text: Length, Subject, Spelling Error.")
+    if st.button("Start Text Auto-labeling"):
+        cmd_text = [
+            sys.executable, "src/autolabel_text.py",
+            "--dataset", dataset_dir,
+            "--output", text_attributes_path,
+            "--api_url", api_url,
+            "--api_key", api_key,
+            "--model", vlm_model
+        ]
+        with st.spinner("Labeling Text... check terminal."):
+            process = subprocess.Popen(cmd_text, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout, stderr = process.communicate()
+            if process.returncode == 0:
+                st.success("Text labeling complete!")
+                st.text_area("Text Output", stdout)
+            else:
+                st.error("Text labeling failed.")
+                st.text_area("Text Error", stderr)
+
 with tab5:
     st.header("Dataset Analysis")
     st.write("Analyze the distribution of tags in your dataset.")
@@ -687,6 +810,34 @@ with tab5:
     if st.button("Load & Analyze Dataset", key="btn_analyze"):
          if not os.path.exists(dataset_dir):
             st.error("Dataset directory not found.")
+         else:
+            items = load_data(dataset_dir, mapping_path, filter_json_path, text_attributes_path)
+            st.success(f"Loaded {len(items)} items.")
+
+            # Aggregate Tags
+            tag_counts = {}
+            for item in items:
+                for k, v in item.attributes.items():
+                    if k == 'filename': continue
+                    if k not in tag_counts: tag_counts[k] = {}
+                    if v not in tag_counts[k]: tag_counts[k][v] = 0
+                    tag_counts[k][v] += 1
+
+            # Display
+            if not tag_counts:
+                st.warning("No tags found. Run Auto-labeling first.")
+            else:
+                for cat in sorted(tag_counts.keys()):
+                    st.subheader(f"Attribute: {cat}")
+                    data = tag_counts[cat]
+                    df = pd.DataFrame(list(data.items()), columns=["Value", "Count"])
+                    df = df.sort_values(by="Count", ascending=False)
+
+                    c1, c2 = st.columns([1, 2])
+                    with c1:
+                        st.dataframe(df, hide_index=True)
+                    with c2:
+                        st.bar_chart(df.set_index("Value"))
          else:
             items = load_data(dataset_dir, mapping_path, filter_json_path)
             st.success(f"Loaded {len(items)} items.")
@@ -723,6 +874,101 @@ with tab4:
 
     selected_runs = st.multiselect("Select runs to compare", history_files)
     baseline_run = st.selectbox("Select Baseline Run", selected_runs) if selected_runs else None
+
+    # --- Joint Tag Calculator for History ---
+    # Need to verify if we can do this. We need sample_results in runs.
+
+    st.markdown("### Joint Tag Calculator (Across Runs)")
+
+    # We load runs first to see available tags? No, we use CURRENT items/attributes to define the query.
+    # The user constructs a query using current tags.
+    # We then apply this query to selected runs.
+    # Requirement: The sample MD5s in history must match current MD5s.
+
+    if st.button("Load Data for Joint Calc"):
+        if not os.path.exists(dataset_dir):
+            st.error("Dataset directory not found.")
+        else:
+            items = load_data(dataset_dir, mapping_path, filter_json_path, text_attributes_path)
+            st.session_state["items_history"] = items
+            st.success(f"Loaded {len(items)} items and current attributes.")
+
+    if "items_history" in st.session_state and selected_runs:
+        items = st.session_state["items_history"]
+
+        # Build Filter Options from current items
+        hist_filter_options = {}
+        for item in items:
+            for k, v in item.attributes.items():
+                if k not in hist_filter_options: hist_filter_options[k] = set()
+                hist_filter_options[k].add(v)
+
+        all_hist_options = []
+        for k, vals in hist_filter_options.items():
+            for v in vals:
+                all_hist_options.append(f"{k}: {v}")
+        all_hist_options.sort()
+
+        hist_joint_selection = st.multiselect("Select Joint Tags (Current Attrs)", all_hist_options, key="hist_joint")
+
+        if st.button("Calculate Joint Accuracy for Runs"):
+            # 1. Identify valid MD5s matching the selection
+            valid_md5s = set()
+            for item in items:
+                match = True
+                for req_tag in hist_joint_selection:
+                    k, v = req_tag.split(": ", 1)
+                    if item.attributes.get(k) != v:
+                        match = False
+                        break
+                if match:
+                    valid_md5s.add(item.md5)
+
+            st.info(f"Found {len(valid_md5s)} samples in current dataset matching selection.")
+
+            # 2. Iterate runs and calculate stats for these MD5s
+            if len(valid_md5s) > 0:
+                summary_rows = []
+                for fname in selected_runs:
+                    path = os.path.join(HISTORY_DIR, fname)
+                    try:
+                        with open(path) as f:
+                            data = json.load(f)
+
+                        sample_res = data.get("sample_results", [])
+                        if not sample_res:
+                            # Old run without sample data
+                            summary_rows.append({"Run": fname, "Acc@1": "N/A", "Acc@5": "N/A", "Count": 0})
+                            continue
+
+                        # Filter
+                        hits1 = []
+                        hits5 = []
+
+                        for s in sample_res:
+                            # Use MD5 if available, else filename match if MD5 missing (compatibility)
+                            s_md5 = s.get("md5")
+                            if s_md5 and s_md5 in valid_md5s:
+                                hits1.append(s["hit1"])
+                                hits5.append(s["hit5"])
+
+                        cnt = len(hits1)
+                        if cnt > 0:
+                            acc1 = sum(hits1) / cnt
+                            acc5 = sum(hits5) / cnt
+                            summary_rows.append({
+                                "Run": fname,
+                                "Acc@1": f"{acc1:.2%}",
+                                "Acc@5": f"{acc5:.2%}",
+                                "Count": cnt
+                            })
+                        else:
+                            summary_rows.append({"Run": fname, "Acc@1": "-", "Acc@5": "-", "Count": 0})
+
+                    except Exception as e:
+                        st.error(f"Error reading {fname}: {e}")
+
+                st.table(summary_rows)
 
     if st.button("Generate Comparison Report"):
         if not selected_runs:

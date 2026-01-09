@@ -22,13 +22,16 @@ class DatasetItem:
         self.attributes = attributes or {}
 
 class DataLoader:
-    def __init__(self, data_dir: str, mapper: LabelMapper, seed: int = 42, filter_json_path: str = None):
+    def __init__(self, data_dir: str, mapper: LabelMapper, seed: int = 42, filter_json_path: str = None, text_attributes_path: str = None):
         self.data_dir = data_dir
         self.mapper = mapper
         self.rng = random.Random(seed)
         self.filter_json_path = filter_json_path
+        self.text_attributes_path = text_attributes_path
         self.items: List[DatasetItem] = []
         self.filter_data = {}
+        self.text_attributes_data = {}
+
         if self.filter_json_path and os.path.exists(self.filter_json_path):
             try:
                 with open(self.filter_json_path, 'r', encoding='utf-8') as f:
@@ -36,12 +39,22 @@ class DataLoader:
             except Exception as e:
                 print(f"[Error] Failed to load filter JSON: {e}")
 
+        if self.text_attributes_path and os.path.exists(self.text_attributes_path):
+            try:
+                with open(self.text_attributes_path, 'r', encoding='utf-8') as f:
+                    self.text_attributes_data = json.load(f)
+            except Exception as e:
+                print(f"[Error] Failed to load text attributes JSON: {e}")
+
     def _calculate_md5(self, filepath: str) -> str:
         hash_md5 = hashlib.md5()
         with open(filepath, "rb") as f:
             for chunk in iter(lambda: f.read(4096), b""):
                 hash_md5.update(chunk)
         return hash_md5.hexdigest()
+
+    def _calculate_text_md5(self, text: str) -> str:
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
 
     def load(self) -> List[DatasetItem]:
         pairs = self._find_images_and_labels(self.data_dir)
@@ -70,12 +83,45 @@ class DataLoader:
             # Calculate MD5
             md5 = self._calculate_md5(img_path)
 
-            # Get attributes from filter data
-            # Key could be image name or md5, we check both. Prioritize MD5.
+            # Get Image attributes
             img_name = os.path.basename(img_path)
-            attributes = self.filter_data.get(md5) or self.filter_data.get(img_name) or {}
+            img_attrs = self.filter_data.get(md5) or self.filter_data.get(img_name) or {}
 
-            items.append(DatasetItem(img_path, txt_path, valid_lines, expanded_gt, rep_text, md5, attributes))
+            # Get Text attributes
+            text_md5 = self._calculate_text_md5(rep_text)
+            txt_attrs_raw = self.text_attributes_data.get(text_md5, {})
+
+            # Merge attributes. To avoid collision and allow separation, we can prefix?
+            # User wants independent plotting.
+            # Let's clean txt_attrs to exclude "text" key if present
+            txt_attrs = {k: v for k, v in txt_attrs_raw.items() if k != "text"}
+
+            # We will use prefixes to distinguish in UI: "Img: " and "Txt: "
+            # Or just "Txt: " since old ones didn't have prefix.
+            # But wait, existing code splits by ": " for groups.
+            # So "Txt: Length" -> Group "Txt". "Length: Short" -> Group "Length".
+            # If I want Group "Length", key should be "Length", value "Short".
+            # The UI logic is: "Key: Value". Group is Key.
+            # So if I have key="Length", val="Short". Group="Length".
+            # If I have key="Person Size", val="Small". Group="Person Size".
+
+            # If I want to distinguish Text vs Image in UI, I need to know the SOURCE of the attribute key.
+            # I can store them in a way that I can retrieve source later.
+            # DatasetItem attributes is a flat dict.
+
+            final_attributes = {}
+            for k, v in img_attrs.items():
+                if k == "filename": continue
+                final_attributes[k] = v # Assume these are Image attributes
+
+            for k, v in txt_attrs.items():
+                final_attributes[k] = v # Text attributes
+
+            # We also store metadata about keys?
+            # Or we can just rely on the set of keys known to be text.
+            # For now, let's just merge. Logic in app.py can distinguish if we pass the sets of keys.
+
+            items.append(DatasetItem(img_path, txt_path, valid_lines, expanded_gt, rep_text, md5, final_attributes))
             
         self.items = items
         return items

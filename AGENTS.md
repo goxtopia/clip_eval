@@ -23,8 +23,17 @@ This project is a CLIP Evaluation Tool designed to assess the performance of CLI
 -   **Optimization:** Resizes images to a maximum dimension of 1024px before sending to the VLM to reduce latency and cost.
 -   **Storage:** Attributes are stored keyed by the image's MD5 hash to avoid re-processing duplicates.
 
-### 3. History & Comparison (`app.py` - Tab 4)
+### 3. Text Auto-labeling (`src/autolabel_text.py` - Tab 3)
+-   **Function:** Independent tool to tag text descriptions in the dataset.
+-   **Attributes:**
+    -   `Length`: Calculated by word count (Short <3, Mid <6, Long <9, Very Long >=9).
+    -   `Subject`: Person, Car, Animal, Scene (via LLM).
+    -   `Spelling Error`: Yes / No (via LLM).
+-   **Storage:** Attributes are stored in `text_attributes.json`.
+
+### 4. History & Comparison (`app.py` - Tab 4)
 -   **Comparison:** Allows users to select multiple past runs from the `history/` folder and choose a **Baseline Run**.
+-   **Joint Calculation:** Allows constructing complex queries (e.g., "Blur: No" AND "Subject: Person") using current dataset attributes to filter and aggregate metrics across historical runs.
 -   **Reporting:** Generates a unified HTML report containing:
     -   A summary table of runs (Model, Samples, Top-1 Acc, Active Filters).
     -   Detailed **Matrix Breakdown** tables comparing accuracy across attributes for each run.
@@ -34,7 +43,7 @@ This project is a CLIP Evaluation Tool designed to assess the performance of CLI
     -   Downloadable HTML report.
 -   **Visualization:** Displays a simple bar chart of Global Top-1 accuracy for selected runs.
 
-### 4. Dataset Analysis (`app.py` - Tab 5)
+### 5. Dataset Analysis (`app.py` - Tab 5)
 -   **Function:** Analyzes and visualizes the distribution of attributes/tags within the dataset.
 -   **Features:**
     -   Loads the dataset and filter JSON.
@@ -43,7 +52,8 @@ This project is a CLIP Evaluation Tool designed to assess the performance of CLI
 
 ## Project Structure
 -   `app.py`: Main Streamlit entry point. Handles UI, evaluation orchestration, and reporting.
--   `src/autolabel.py`: Script for auto-labeling images. Can be run via UI or CLI.
+-   `src/autolabel.py`: Script for auto-labeling images.
+-   `src/autolabel_text.py`: Script for auto-labeling texts.
 -   `src/data.py`: Handles data loading and dataset management.
 -   `src/model.py`: Wraps the CLIP model interactions (loading, encoding). Supports both `open_clip` and Hugging Face `transformers` backends. Includes caching and "Red vs Blue" sanity check.
 -   `src/metrics.py`: Computes I2T metrics (Top-1, Top-5, per-class).
